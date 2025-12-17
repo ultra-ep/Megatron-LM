@@ -18,6 +18,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         args.num_query_groups = args.num_attention_heads
     # MoE.
     num_experts = 1 if args.num_experts is None else args.num_experts
+    num_activated_experts = args.moe_router_topk
     gated_linear_multiplier = 3 / 2 if args.swiglu else 1
     
     shared_expert_ffn_hidden_size = (
@@ -113,6 +114,19 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         )
         + self_attn_term
     )
+    num_parameters_in_transformer_layer_moe_activated = (
+        2
+        * args.hidden_size
+        * (
+            # MoE MLP.
+            + (moe_ffn_hidden_size * num_activated_experts * gated_linear_multiplier)
+            # Shared MoE MLP.
+            + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
+            # Transformer layernorms.
+            + (2)
+        )
+        + self_attn_term
+    )
     embedding_size = args.hidden_size * args.padded_vocab_size
     final_layernorm = 2 * args.hidden_size
     if args.untie_embeddings_and_output_weights:
@@ -124,12 +138,22 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         + num_parameters_in_transformer_layer_moe * num_moe_layers
         + final_layernorm
     )
+    num_activated_parameters_in_transformer_block = (
+        num_parameters_in_transformer_layer_dense * num_dense_layers
+        + num_parameters_in_transformer_layer_moe_activated * num_moe_layers
+        + final_layernorm
+    )
     num_parameters_in_mtp_block = (
         num_parameters_in_transformer_layer_dense * mtp_num_dense_layers
         + num_parameters_in_transformer_layer_moe * mtp_num_moe_layers
     )
     num_total_parameters = (
         num_parameters_in_transformer_block
+        + num_parameters_in_mtp_block
+        + num_parameters_in_embedding_layers
+    )
+    num_total_activated_parameters = (
+        num_activated_parameters_in_transformer_block
         + num_parameters_in_mtp_block
         + num_parameters_in_embedding_layers
     )
@@ -148,6 +172,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             f"{num_parameters_in_embedding_layers / 10**9:.2f}"
         )
         print(f"Total number of parameters in billions: {num_total_parameters / 10**9:.2f}")
+        print(f"    where activated parameters in billions: {num_total_activated_parameters / 10**9:.2f}")
 
     # Most loaded model shard has (1/pp_size transformer layers + 1 mtp block + 1 embedding layer) / tp_size.
     num_parameters_on_most_loaded_model_shard = (
