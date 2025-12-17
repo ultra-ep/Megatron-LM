@@ -3485,6 +3485,10 @@ def _add_experimental_args(parser):
                             'precision-aware-optimizer. This dtype is used for storing the '
                             'optimizer state in memory during training but does not affect '
                             'the precision in the kernel computation.')
+    group.add_argument('--vram-profile-iters', nargs='+', type=int, default=[],
+                       help='Iterations to profile VRAM usage.')
+    group.add_argument('--vram-snapshot-save-dir', type=str, default=None,
+                       help='Directory to save VRAM snapshot pickle files.')
     return parser
 
 

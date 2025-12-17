@@ -691,6 +691,11 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    # from megatron.training.theoretical_memory_usage import compute_weight_and_optimizer_memory
+    # if torch.distributed.get_rank() == 0:
+    #     compute_weight_and_optimizer_memory(args, verbose=True)
+    # exit()
+
     if args.log_progress:
         append_to_progress_log("Starting job")
 
@@ -2462,6 +2467,9 @@ def train(
                 buffered_rollouts = train_data_iterator
 
         ft_integration.on_training_step_start()
+        profile_vram = iteration in args.vram_profile_iters
+        if profile_vram:
+            torch.cuda.memory._record_memory_history()
         (
             loss_dict,
             skipped_iter,
@@ -2474,6 +2482,14 @@ def train(
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
+        if profile_vram:
+            if args.vram_snapshot_save_dir is not None:
+                os.makedirs(args.vram_snapshot_save_dir, exist_ok=True)
+                snapshot_path = os.path.join(args.vram_snapshot_save_dir, f"vram_iter_{iteration}_rank{torch.distributed.get_rank()}.pickle")
+            else:
+                snapshot_path = f"vram_iter_{iteration}_rank{torch.distributed.get_rank()}.pickle"
+            torch.cuda.memory._dump_snapshot(snapshot_path)
+            torch.cuda.memory._record_memory_history(enabled=None)
         ft_integration.on_training_step_end()
         if should_checkpoint:
             save_checkpoint_and_time(
