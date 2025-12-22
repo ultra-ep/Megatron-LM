@@ -234,6 +234,12 @@ class TransformerConfig(ModelParallelConfig):
     """Number of SMs to use for HybridEP. In pure NVL scenarios, 
     16 SMs can generally achieve good bandwidth."""
 
+    moe_deepep_v2_dispatch_sms: int = 32
+    """Number of SMs to use for DeepEP v2 dispatch."""
+
+    moe_deepep_v2_combine_sms: int = 32
+    """Number of SMs to use for DeepEP v2 combine."""
+
     ####################
     # attention variant
     ####################
@@ -1019,6 +1025,8 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
             if self.moe_flex_dispatcher_backend == "hybridep":
+                raise ValueError("Only one backend is supported for flex token dispatcher.")
+            if self.moe_flex_dispatcher_backend == "deepep-v2":
                 raise ValueError("Only one backend is supported for flex token dispatcher.")
             self.moe_flex_dispatcher_backend = "deepep"
             warnings.warn(

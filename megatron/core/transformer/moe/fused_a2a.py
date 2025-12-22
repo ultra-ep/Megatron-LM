@@ -14,6 +14,7 @@ except ImportError:
     HAVE_DEEP_EP = False
 
 import torch
+from typing import Optional
 
 _buffer = None
 
@@ -263,6 +264,223 @@ else:
     fused_dispatch = None
     fused_combine = None
     set_deepep_num_sms = None
+
+
+try:
+    from deep_ep import Buffer
+    from deep_ep.utils.event import EventHandle, EventOverlap
+
+    HAVE_DEEP_EP_V2 = True
+except ImportError:
+    HAVE_DEEP_EP_V2 = False
+
+_deepep_v2_buffer = None
+
+def init_deepep_v2_buffer(
+    group: torch.distributed.ProcessGroup,
+    seq_len: Optional[int] = None,
+    hidden_dim: Optional[int] = None,
+) -> None:
+    """Initialize the DeepEP v2 buffer.
+    Suppose seq_len and hidden_dim are fixed, the buffer will be initialized once and reused.
+    """
+    global _deepep_v2_buffer
+    _deepep_v2_buffer = Buffer(
+        group, 
+        num_max_tokens_per_rank=seq_len, 
+        hidden=hidden_dim,
+    )
+
+class FusedDispatchV2(torch.autograd.Function):
+    """Fused dispatch operation for MoE routing combining computation and communication."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+        no_cpu_sync=False,
+    ):
+        """Forward pass of fused dispatch v2."""
+        previous_event = None
+        if async_finish:
+            previous_event = EventHandle()
+        # Calculate layout before actual dispatch
+        if _deepep_v2_buffer is None:
+            init_deepep_v2_buffer(group, x.size(0), x.size(1))
+
+        # Do MoE dispatch
+        # NOTES: the CPU will wait for GPU's signal to arrive,
+        # so this is not compatible with CUDA graph
+        (
+            recv_x,
+            recv_token_indices,
+            recv_token_probs,
+            num_recv_tokens_per_expert_list,
+            handle,
+            after_event_overlap,
+        ) = _deepep_v2_buffer.dispatch(
+            x,
+            topk_idx=token_indices,
+            topk_weights=token_probs,
+            num_experts=num_experts,
+            expert_alignment=1,
+            previous_event=previous_event,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+            no_cpu_sync=no_cpu_sync,
+        )
+
+        # Make sure current stream is synchronized
+        if async_finish:
+            after_event_overlap.current_stream_wait()
+
+        # Save for backward
+        ctx.group = group
+        ctx.handle = handle
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
+
+        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+
+    @staticmethod
+    def backward(
+        ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
+    ):
+        """Backward pass of fused dispatch v2."""
+        handle = ctx.handle
+        previous_event = None
+        if ctx.async_finish:
+            previous_event = EventHandle()
+        grad_x, grad_token_probs, after_event = _deepep_v2_buffer.combine(
+            x=grad_output.contiguous(),
+            handle=handle,
+            topk_weights=grad_token_probs.float(),
+            previous_event=previous_event,
+            async_with_compute_stream=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        # Make sure current stream is synchronized
+        if ctx.async_finish:
+            after_event.current_stream_wait()
+        return grad_x, None, grad_token_probs, None, None, None, None, None
+
+
+class FusedCombineV2(torch.autograd.Function):
+    """Fused combine operation for MoE output combining computation and communication."""
+
+    @staticmethod
+    def forward(
+            ctx,
+            x, 
+            group, 
+            handle, 
+            async_finish=False, 
+            allocate_on_comm_stream=False,
+        ):
+        """Forward pass of fused combine."""
+        previous_event = None
+        if async_finish:
+            previous_event = EventHandle()
+        combined_x, _, after_event = _deepep_v2_buffer.combine(
+            x,
+            handle=handle,
+            previous_event=previous_event,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        # Make sure current stream is synchronized
+        if async_finish:
+            after_event.current_stream_wait()
+
+        ctx.handle = handle
+        ctx.group = group
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        return combined_x, None
+
+    @staticmethod
+    def backward(ctx, grad_output, previous_event=None):
+        """Backward pass of fused combine."""
+        previous_event = None
+        if ctx.async_finish:
+            previous_event = EventHandle()
+        grad_x, _, _, _, _, after_event = _deepep_v2_buffer.dispatch(
+            x=grad_output.contiguous(),
+            handle=ctx.handle,
+            previous_event=previous_event,
+            async_with_compute_stream=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        # Make sure current stream is synchronized
+        if ctx.async_finish:
+            after_event.current_stream_wait()
+        return grad_x, None, None, None, None
+
+
+if HAVE_DEEP_EP_V2:
+
+    def fused_dispatch_v2(
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+        no_cpu_sync=False,
+    ):
+        """Perform fused dispatch operation if deep_ep is available.
+
+        Args:
+            x: Input tensor [num_tokens, hidden_size]
+            token_indices: Token routing indices [num_tokens, topk]
+            token_probs: Token routing probabilities [num_tokens, topk]
+            num_experts: Number of experts
+            group: Process group
+
+        Returns:
+            Result of FusedDispatch
+        """
+        return FusedDispatchV2.apply(
+            x.contiguous(),
+            token_indices,
+            token_probs,
+            num_experts,
+            group,
+            async_finish,
+            allocate_on_comm_stream,
+            no_cpu_sync,
+        )
+
+    def fused_combine_v2(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
+        """Perform fused combine operation if deep_ep is available.
+
+        Args:
+            x: Input tensor
+            group: Process group
+            handle: Communication handle
+
+        Returns:
+            Result of FusedCombine
+        """
+        return FusedCombineV2.apply(x, group, handle, async_finish, allocate_on_comm_stream)
+    
+    def set_deepep_v2_num_sms(num_sms_dispatch: int, num_sms_combine: int):
+        """Sets the number of SMs to use for DeepEP v2"""
+        Buffer.set_num_sms_dispatch(num_sms_dispatch)
+        Buffer.set_num_sms_combine(num_sms_combine)
+
+else:
+    fused_dispatch_v2 = None
+    fused_combine_v2 = None
+    set_deepep_v2_num_sms = None
 
 
 try:

@@ -3273,11 +3273,15 @@ def _add_moe_args(parser):
     group.add_argument('--moe-enable-deepep', action='store_true',
                        help='DEPRECATED: Please use --moe-flex-dispatcher-backend=deepep instead.')
     group.add_argument('--moe-flex-dispatcher-backend', type=str,
-                       choices=['deepep', 'hybridep'],
+                       choices=['deepep', 'hybridep', 'deepep-v2'],
                        default='deepep',
-                       help='The backend to use for flex token dispatcher. The default is "deepep". Options are "deepep" and "hybridep".')
+                       help='The backend to use for flex token dispatcher. The default is "deepep". Options are "deepep", "hybridep" and "deepep-v2".')
     group.add_argument('--moe-deepep-num-sms', type=int, default=20,
                        help='Number of SMs to use for DeepEP.')
+    group.add_argument('--moe-deepep-v2-dispatch-sms', type=int, default=32,
+                       help='Number of SMs to use for DeepEP v2 dispatch.')
+    group.add_argument('--moe-deepep-v2-combine-sms', type=int, default=32,
+                       help='Number of SMs to use for DeepEP v2 combine.')
     group.add_argument('--moe-hybridep-num-sms', type=int, default=16,
                        help='Number of SMs to use for HybridEP.')
     group.add_argument('--moe-permute-fusion', action='store_true',
