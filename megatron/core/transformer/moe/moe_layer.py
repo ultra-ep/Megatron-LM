@@ -137,11 +137,16 @@ class MoELayer(BaseMoELayer):
                 pg_collection=pg_collection,
             )
         elif config.moe_token_dispatcher_type == "alltoall":
+            if self.layer_number in config.layer_numbers_to_dump_expert_load:
+                layer_number_to_dump_expert_load = self.layer_number
+            else:
+                layer_number_to_dump_expert_load = None
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
+                layer_number_to_dump_expert_load=layer_number_to_dump_expert_load
             )
         elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(

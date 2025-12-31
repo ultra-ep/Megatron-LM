@@ -350,6 +350,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if isinstance(submodules.mlp, ModuleSpec):
             if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
                 additional_mlp_kwargs["pg_collection"] = pg_collection
+                additional_mlp_kwargs["layer_number"] = self.layer_number
             elif submodules.mlp.module == MLP:
                 assert hasattr(
                     pg_collection, 'tp'
