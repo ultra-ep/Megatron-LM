@@ -51,6 +51,7 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import internal_api
+from megatron.core.transformer.moe.eplb.manager import EPLBManager
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -77,6 +78,7 @@ class GroupedMLP(MegatronModule):
         num_local_experts: int,
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        eplb_manager: Optional[EPLBManager] = None,
     ):
         super().__init__(config=config)
         self.config: TransformerConfig = config
@@ -734,6 +736,9 @@ class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
     Executes multiple experts in parallel to maximize computational efficiency.
+    
+    When EPLB is enabled, this class handles both original experts and replica
+    experts. The number of local experts includes replicas in that case.
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
@@ -744,9 +749,23 @@ class TEGroupedMLP(MegatronModule):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        eplb_manager: Optional[EPLBManager] = None,
     ):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
+        
+        # EPLB support
+        self.eplb_manager = eplb_manager
+        self.eplb_enabled = eplb_manager is not None
+        if self.eplb_enabled:
+            self.num_local_physical_experts = eplb_manager.num_local_physical_experts
+            assert self.num_local_physical_experts == self.num_local_experts, \
+                "num_local_physical_experts should be equal to num_local_experts"
+            self.num_local_master_experts = eplb_manager.num_local_master_experts
+            self.num_local_replica_experts = eplb_manager.num_redundant_per_rank
+            assert self.num_local_master_experts + self.num_local_replica_experts == self.num_local_physical_experts, \
+                "num_local_master_experts + num_local_replica_experts should be equal to num_local_physical_experts"
+        
         self.input_size = self.config.hidden_size
         assert not (
             self.config.add_bias_linear and config.bias_dropout_fusion
@@ -822,6 +841,37 @@ class TEGroupedMLP(MegatronModule):
             assert HAVE_TE, "FP8 and FP4 requires TE."
             self.quantization_padding = Fp8Padding(self.num_local_experts)
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
+
+        # Mark replica expert parameters to exclude them from optimizer state allocation.
+        # Replicas only need gradient buffers for accumulation; their optimizer states would
+        # be wasted since weights are always synchronized from masters after optimizer step.
+        if self.eplb_enabled:
+            self._mark_replica_parameters()
+
+    def _mark_replica_parameters(self):
+        """Mark replica expert parameters with is_eplb_replica=True attribute.
+        
+        This allows the optimizer to skip allocating states for these parameters,
+        saving GPU memory. Replica parameters still compute gradients (which are
+        aggregated to masters), but don't need their own optimizer states.
+        """
+        num_local_master = self.eplb_manager.num_local_master_experts
+        num_redundant = self.eplb_manager.num_redundant_per_rank
+        
+        for linear_module in [self.linear_fc1, self.linear_fc2]:
+            for replica_idx in range(num_redundant):
+                local_physical_idx = num_local_master + replica_idx
+                
+                # Mark weight parameter
+                replica_weight = getattr(linear_module, f'weight{local_physical_idx}', None)
+                if replica_weight is not None:
+                    setattr(replica_weight, 'is_eplb_replica', True)
+                
+                # Mark bias parameter if present
+                if self.config.add_bias_linear:
+                    replica_bias = getattr(linear_module, f'bias{local_physical_idx}', None)
+                    if replica_bias is not None:
+                        setattr(replica_bias, 'is_eplb_replica', True)
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
@@ -1036,6 +1086,207 @@ class TEGroupedMLP(MegatronModule):
         """
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
+
+    def aggregate_replica_gradients_with_master(self):
+        """Aggregate gradients from replica experts to their source originals.
+        
+        For TEGroupedMLP, gradients are stored in linear_fc1 and linear_fc2 modules.
+        Each module has weight parameters named weight0, weight1, ..., weight{n-1}.
+        This method aggregates replica gradients to original experts' gradients.
+        
+        The algorithm:
+        1. For each weight type (fc1/fc2), stack replica gradients into a buffer
+        2. Place replica gradients at their logical expert positions in a global buffer
+        3. All-reduce to collect all gradient contributions across EP ranks
+        4. Add the aggregated contributions to local master gradients
+        """
+        if not self.eplb_enabled or self.eplb_manager is None:
+            return
+        
+        if not self.eplb_manager._placement_initialized:
+            return
+        
+        ep_group = self.eplb_manager.ep_group
+        ep_rank = self.eplb_manager.ep_rank
+        num_local_master = self.eplb_manager.num_local_master_experts
+        num_redundant = self.eplb_manager.num_redundant_per_rank
+        num_local_physical = self.eplb_manager.num_local_physical_experts
+        num_global_logical = self.eplb_manager.num_global_logical_experts
+        
+        if num_redundant == 0:
+            return
+        
+        physical_to_logical = self.eplb_manager.placement.physical_to_logical_map
+        
+        # Process each linear layer (fc1 and fc2)
+        for linear_module in [self.linear_fc1, self.linear_fc2]:
+            # Get reference weight to determine shape and dtype
+            ref_weight = getattr(linear_module, 'weight0')
+            weight_shape = ref_weight.shape
+            dtype = ref_weight.dtype
+            device = ref_weight.device
+            
+            # Create global buffer for logical expert gradient contributions from replicas
+            global_replica_contrib = torch.zeros(
+                (num_global_logical, *weight_shape),
+                dtype=dtype,
+                device=device,
+            )
+            
+            # Place local replica gradients at their logical expert positions
+            for replica_idx in range(num_redundant):
+                local_physical_idx = num_local_master + replica_idx
+                global_physical_idx = ep_rank * num_local_physical + local_physical_idx
+                
+                # Get the replica weight and its gradient
+                replica_weight = getattr(linear_module, f'weight{local_physical_idx}')
+                if replica_weight.grad is None:
+                    continue
+                
+                # Get logical expert this replica represents
+                logical_idx = physical_to_logical[global_physical_idx].item()
+                global_replica_contrib[logical_idx] += replica_weight.grad
+                
+                # Clear replica gradient to prevent duplicate accumulation
+                # across multiple backward passes for the same replica in online EPLB
+                replica_weight.grad.zero_()
+            
+            # All-reduce to collect all replica gradient contributions
+            torch.distributed.all_reduce(global_replica_contrib, group=ep_group)
+            
+            # Add contributions to local master experts' gradients
+            for local_idx in range(num_local_master):
+                global_physical_idx = ep_rank * num_local_physical + local_idx
+                logical_idx = physical_to_logical[global_physical_idx].item()
+                
+                master_weight = getattr(linear_module, f'weight{local_idx}')
+                if master_weight.grad is not None:
+                    master_weight.grad.add_(global_replica_contrib[logical_idx])
+            
+            # Also handle bias if present
+            if self.config.add_bias_linear:
+                ref_bias = getattr(linear_module, 'bias0', None)
+                if ref_bias is not None:
+                    bias_shape = ref_bias.shape
+                    
+                    global_bias_contrib = torch.zeros(
+                        (num_global_logical, *bias_shape),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    
+                    for replica_idx in range(num_redundant):
+                        local_physical_idx = num_local_master + replica_idx
+                        global_physical_idx = ep_rank * num_local_physical + local_physical_idx
+                        
+                        replica_bias = getattr(linear_module, f'bias{local_physical_idx}', None)
+                        if replica_bias is not None and replica_bias.grad is not None:
+                            logical_idx = physical_to_logical[global_physical_idx].item()
+                            global_bias_contrib[logical_idx] += replica_bias.grad
+                            replica_bias.grad.zero_()
+                    
+                    torch.distributed.all_reduce(global_bias_contrib, group=ep_group)
+                    
+                    for local_idx in range(num_local_master):
+                        global_physical_idx = ep_rank * num_local_physical + local_idx
+                        logical_idx = physical_to_logical[global_physical_idx].item()
+                        
+                        master_bias = getattr(linear_module, f'bias{local_idx}', None)
+                        if master_bias is not None and master_bias.grad is not None:
+                            master_bias.grad.add_(global_bias_contrib[logical_idx])
+
+    def synchronize_replica_weights_with_master(self):
+        """Synchronize replica weights from their source originals.
+        This will refresh all replica weights to source master experts, and should be
+        used after optimizer step or start training.
+        *There will be more efficient impl for online weight updating for redundant experts.
+        
+        For TEGroupedMLP, weights are stored in linear_fc1 and linear_fc2 modules.
+        Each module has weight parameters named weight0, weight1, ..., weight{n-1}.
+        This method synchronizes replica weights from original experts after optimizer step.
+        
+        The algorithm:
+        1. Stack local master weights and all-gather across EP ranks
+        2. For each local replica, find its source master and copy weights
+        """
+        if not self.eplb_enabled or self.eplb_manager is None:
+            return
+        
+        if not self.eplb_manager._placement_initialized:
+            return
+        
+        ep_group = self.eplb_manager.ep_group
+        ep_size = self.eplb_manager.ep_size
+        ep_rank = self.eplb_manager.ep_rank
+        num_local_master = self.eplb_manager.num_local_master_experts
+        num_redundant = self.eplb_manager.num_redundant_per_rank
+        num_local_physical = self.eplb_manager.num_local_physical_experts
+        
+        if num_redundant == 0:
+            return
+        
+        physical_to_logical = self.eplb_manager.placement.physical_to_logical_map
+        logical_to_physical = self.eplb_manager.placement.logical_to_physical_map
+        
+        # Process each linear layer (fc1 and fc2)
+        for linear_module in [self.linear_fc1, self.linear_fc2]:
+            # Stack local master weights
+            master_weights = torch.stack([
+                getattr(linear_module, f'weight{i}').data 
+                for i in range(num_local_master)
+            ], dim=0)
+            
+            # All-gather master weights from all ranks
+            # Shape: [ep_size, num_local_master, ...]
+            gathered_list = [torch.empty_like(master_weights) for _ in range(ep_size)]
+            torch.distributed.all_gather(gathered_list, master_weights, group=ep_group)
+            all_master_weights = torch.stack(gathered_list, dim=0)
+            
+            # For each local replica, find its source master and copy weights
+            for replica_idx in range(num_redundant):
+                local_physical_idx = num_local_master + replica_idx
+                global_physical_idx = ep_rank * num_local_physical + local_physical_idx
+                
+                # Get logical expert this replica represents
+                logical_idx = physical_to_logical[global_physical_idx].item()
+                
+                # Get master physical index (first entry in logical_to_physical is the master)
+                master_physical_idx = logical_to_physical[logical_idx, 0].item()
+                
+                # Compute source rank and local index from master physical index
+                source_rank = master_physical_idx // num_local_physical
+                source_local_idx = master_physical_idx % num_local_physical
+                
+                # Copy weights from source master to replica
+                replica_weight = getattr(linear_module, f'weight{local_physical_idx}')
+                replica_weight.data.copy_(all_master_weights[source_rank, source_local_idx])
+            
+            # Also handle bias if present
+            if self.config.add_bias_linear:
+                ref_bias = getattr(linear_module, 'bias0', None)
+                if ref_bias is not None:
+                    master_biases = torch.stack([
+                        getattr(linear_module, f'bias{i}').data 
+                        for i in range(num_local_master)
+                    ], dim=0)
+                    
+                    gathered_bias_list = [torch.empty_like(master_biases) for _ in range(ep_size)]
+                    torch.distributed.all_gather(gathered_bias_list, master_biases, group=ep_group)
+                    all_master_biases = torch.stack(gathered_bias_list, dim=0)
+                    
+                    for replica_idx in range(num_redundant):
+                        local_physical_idx = num_local_master + replica_idx
+                        global_physical_idx = ep_rank * num_local_physical + local_physical_idx
+                        
+                        logical_idx = physical_to_logical[global_physical_idx].item()
+                        master_physical_idx = logical_to_physical[logical_idx, 0].item()
+                        
+                        source_rank = master_physical_idx // num_local_physical
+                        source_local_idx = master_physical_idx % num_local_physical
+                        
+                        replica_bias = getattr(linear_module, f'bias{local_physical_idx}', None)
+                        if replica_bias is not None:
+                            replica_bias.data.copy_(all_master_biases[source_rank, source_local_idx])
 
 
 class SequentialMLP(MegatronModule):

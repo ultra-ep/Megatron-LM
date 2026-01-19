@@ -364,6 +364,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     (5) combine preprocess: sort_chunk(if num_local_experts>1)->RS(TP)
     (6) token combine: A2A(EP)
     (7) combine postprocess: unpermute tokens
+    
+    When EPLB is enabled, the dispatcher handles an expanded routing map that
+    includes both master and replica experts.
     """
 
     # DtoH copies are performed on this stream for overlapping with the main stream.
@@ -375,7 +378,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        layer_number_to_dump_expert_load: Optional[int] = None
+        layer_number_to_dump_expert_load: Optional[int] = None,
+        num_global_physical_experts: Optional[int] = None
     ) -> None:
         """
         Initialize the AlltoAll token dispatcher.
@@ -385,11 +389,17 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             local_expert_indices (List[int]): Indices of local experts on the current device.
             config (TransformerConfig): Configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+            layer_number_to_dump_expert_load (int, optional): Layer number for expert load dumping.
+            num_global_physical_experts (int, optional): Total number of physical experts across all ranks.
         """
         super().__init__(config=config, pg_collection=pg_collection)
         self.num_local_experts = num_local_experts
-        assert config.num_moe_experts is not None
-        self.num_experts = config.num_moe_experts
+        self.num_experts = (
+            num_global_physical_experts
+            if num_global_physical_experts is not None
+            else config.num_moe_experts
+        )
+        assert self.num_experts is not None, "Expected num_experts to be set"
         assert self.num_local_experts > 0, "Expected at least one expert"
         self.local_expert_indices = local_expert_indices
         assert (
@@ -1581,6 +1591,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
     """A flexible token dispatcher that abstracts the underlying tensor and expert
     parallelism. It uses a single communication group over all TP and EP ranks,
     making the dispatch logic independent of the specific parallelism strategy.
+    
+    When EPLB is enabled, the dispatcher handles an expanded routing map that
+    includes both master and replica experts.
     """
 
     def __init__(
@@ -1589,6 +1602,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        num_global_physical_experts: Optional[int] = None
     ):
         """
         Initialize the Flex token dispatcher.
@@ -1598,18 +1612,24 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             local_expert_indices (List[int]): Indices of local experts on the current device.
             config (TransformerConfig): Configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+            num_global_physical_experts (int, optional): Total number of physical experts across all ranks.
         """
         super().__init__(config=config, pg_collection=pg_collection)
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
+        num_moe_experts = (
+            num_global_physical_experts
+            if num_global_physical_experts is not None
+            else config.num_moe_experts
+        )
         if self.config.moe_flex_dispatcher_backend == "deepep":
             self._comm_manager = _DeepepManager(
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,
                 router_topk=self.tp_size * self.config.moe_router_topk,
-                num_experts=self.tp_size * self.config.num_moe_experts,
+                num_experts=self.tp_size * num_moe_experts,
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
@@ -1617,7 +1637,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self._comm_manager = _HybridEPManager(
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,
-                num_experts=self.tp_size * self.config.num_moe_experts,
+                num_experts=self.tp_size * num_moe_experts,
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
@@ -1626,7 +1646,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,
                 router_topk=self.tp_size * self.config.moe_router_topk,
-                num_experts=self.tp_size * self.config.num_moe_experts,
+                num_experts=self.tp_size * num_moe_experts,
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']

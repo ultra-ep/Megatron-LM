@@ -24,6 +24,8 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.moe.experts import TEGroupedMLP
+from megatron.core.transformer.moe.eplb.manager import EPLBManager, HAVE_EPLB
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -124,12 +126,41 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        self.num_local_master_experts = self.num_local_experts
+        self.local_master_expert_indices = self.local_expert_indices
+
+        # Initialize EPLB Manager (if enabled)
+        self.eplb_enabled = config.moe_enable_eplb
+        self.eplb_manager = None
+        
+        if self.eplb_enabled:
+            if not HAVE_EPLB:
+                raise ImportError(
+                    "EPLB is enabled but eplb module could not be imported. "
+                    "Please ensure megatron.core.transformer.moe.eplb is available."
+                )
+            self.eplb_manager = EPLBManager(
+                config=config,
+                num_local_master_experts=self.num_local_master_experts,
+                local_master_expert_indices=self.local_master_expert_indices,
+                ep_group=self.ep_group,
+            )
+            self.eplb_manager.initialize_placement()
+            # Number of experts to compute = local masters + local replicas
+            self.num_local_physical_experts = self.eplb_manager.num_local_physical_experts
+            self.num_global_physical_experts = self.eplb_manager.num_global_physical_experts
+            self.local_physical_expert_indices = self.eplb_manager.local_physical_expert_indices
+        else:
+            self.num_local_physical_experts = self.num_local_master_experts
+            self.num_global_physical_experts = self.config.num_moe_experts
+            self.local_physical_expert_indices = self.local_master_expert_indices
 
         # Initialize router
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
         self.tp_group = pg_collection.tp
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
+            # All Gather dispatcher does not support EPLB
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
@@ -138,22 +169,25 @@ class MoELayer(BaseMoELayer):
             )
         elif config.moe_token_dispatcher_type == "alltoall":
             if self.layer_number in config.layer_numbers_to_dump_expert_load:
+                # Expert load dumping only supports all2all dispatcher
                 layer_number_to_dump_expert_load = self.layer_number
             else:
                 layer_number_to_dump_expert_load = None
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
+                self.num_local_physical_experts,
+                self.local_physical_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
-                layer_number_to_dump_expert_load=layer_number_to_dump_expert_load
+                layer_number_to_dump_expert_load=layer_number_to_dump_expert_load,
+                num_global_physical_experts=self.num_global_physical_experts,
             )
         elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
+                self.num_local_physical_experts,
+                self.local_physical_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
+                num_global_physical_experts=self.num_global_physical_experts,
             )
         else:
             raise ValueError(
@@ -161,12 +195,19 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize experts
+        # When EPLB is enabled, we need to allocate extra capacity for replica experts
         self.experts = build_module(
             self.submodules.experts,
-            self.num_local_experts,
+            self.num_local_physical_experts,  # Includes replicas when EPLB is enabled
             self.config,
             pg_collection=pg_collection,
+            eplb_manager=self.eplb_manager,  # Pass EPLB manager for gradient handling
         )
+        # Initialize replica expert weight based on current placement
+        if self.eplb_enabled:
+            assert isinstance(self.experts, TEGroupedMLP), \
+                f"experts must be a TEGroupedMLP when EPLB is enabled, but got {type(self.experts)}"
+            self.experts.synchronize_replica_weights_with_master()
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -301,6 +342,10 @@ class MoELayer(BaseMoELayer):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map = self.route(hidden_states)
+                # EPLB: expand routing map to include replica assignments
+                if self.eplb_enabled and self.eplb_manager is not None:
+                    routing_map, probs = self.eplb_manager.expand_routing_map(routing_map, probs)
+
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
@@ -332,10 +377,18 @@ class MoELayer(BaseMoELayer):
         return outputs
 
     def backward_dw(self):
-        """Compute weight gradients for experts and shared experts."""
+        """Compute weight gradients for experts and shared experts.
+        
+        When EPLB is enabled, this also aggregates gradients from replica
+        experts to their source (master) experts.
+        """
         self.experts.backward_dw()
         if self.use_shared_expert and not self.shared_expert_overlap:
             self.shared_experts.backward_dw()
+        
+        # EPLB: aggregate replica gradients to source experts
+        if self.eplb_enabled and self.eplb_manager is not None:
+            self.experts.aggregate_replica_gradients_with_master()
 
     def set_for_recompute_pre_mlp_layernorm(self):
         """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8/fp4."""

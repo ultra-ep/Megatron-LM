@@ -3314,6 +3314,20 @@ def _add_moe_args(parser):
                        help="some MoE routers have a D2H sync that will break cuda graphs.  If this flag is set the router will switch" \
                        " to dropping and padding during decode time which does not have a D2H sync. The capacity factor is set to the" \
                        " max that an expert could see during inference so no tokens are actually dropped.")
+    # Experimental EPLB arguments
+    group.add_argument('--moe-enable-eplb', action='store_true',
+                       help='Enable EPLB with redundant experts for better load balancing. '
+                       'When enabled, each EP rank holds additional redundant expert replicas '
+                       'that can be used to balance the load across experts.')
+    group.add_argument('--moe-num-redundant-experts-per-rank', type=int, default=0,
+                       help='Number of redundant expert replicas each EP rank holds. '
+                       'Must be > 0 when moe_enable_eplb is True.')
+    group.add_argument('--moe-eplb-placement-strategy', type=str, default='random', choices=['random', 'online'],
+                       help='Strategy for redundant expert placement. '
+                       'Options are "random" and "online". The default is "random".')
+    group.add_argument('--moe-eplb-dispatch-strategy', type=str, default='random', choices=['random', 'online'],
+                       help='Strategy for redundant expert dispatcher. '
+                       'Options are "random" and "online". The default is "random".')
     return parser
 
 def _add_mla_args(parser):

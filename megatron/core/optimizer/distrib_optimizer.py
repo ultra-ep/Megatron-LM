@@ -288,6 +288,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_map.items():
                 for gbuf_range_map in gbuf_range_map_for_all_buckets:
                     for param in gbuf_range_map["param_map"]:
+                        # Skip parameters not in param_groups (e.g., EPLB replica experts).
+                        # These parameters are in the gradient buffer for gradient computation
+                        # but excluded from optimizer to save memory on optimizer states.
+                        if param not in world_param_group_map:
+                            continue
                         group_index = world_param_group_map[param]
                         group_range = group_ranges[group_index]
                         group_range["params"].append(param)

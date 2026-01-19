@@ -116,6 +116,13 @@ def _get_param_groups(
             if not param.requires_grad:
                 continue
 
+            # Skip EPLB replica expert parameters - they don't need optimizer states
+            # since their weights are always synchronized from masters after optimizer step.
+            # Replicas still compute gradients (aggregated to masters) but shouldn't waste
+            # GPU memory on optimizer states (momentum, variance, etc.).
+            if getattr(param, 'is_eplb_replica', False):
+                continue
+
             uses_default_config = False
             # Get optimizer config for this parameter.
             if config_overrides is None:

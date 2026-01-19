@@ -217,6 +217,9 @@ def get_megatron_muon_optimizer(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+            # Skip EPLB replica expert parameters - they don't need optimizer states
+            if getattr(param, 'is_eplb_replica', False):
+                continue
             # add flag for expert weight so optimizer can figure which tp group it uses
             # alternatively, create new param group and save tp_group. this require more
             # change in optimizer

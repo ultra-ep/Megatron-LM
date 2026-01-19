@@ -693,6 +693,31 @@ class TransformerConfig(ModelParallelConfig):
     layer_numbers_to_dump_expert_load: Optional[List[int]] = None
 
     ##################
+    # EPLB (Expert Parallel Load Balancing)
+    ##################
+    moe_enable_eplb: bool = False
+    """Enable EPLB with redundant experts for better load balancing.
+    When enabled, each EP rank holds additional redundant expert replicas
+    that can be used to balance the load across experts."""
+
+    moe_num_redundant_experts_per_rank: int = 0
+    """Number of redundant expert replicas each EP rank holds.
+    Must be > 0 when moe_enable_eplb is True."""
+
+    moe_eplb_placement_strategy: str = "random"
+    """Strategy for redundant expert placement.
+    Options:
+    - 'random': Random placement (strawman implementation)
+    - 'balanced': Future - placement based on historical load
+    - 'online': Future - dynamic placement updated at runtime"""
+
+    moe_eplb_dispatch_strategy: str = "random"
+    """Strategy for dispatching tokens to expert replicas.
+    Options:
+    - 'random': Random dispatch to original or replica with equal probability
+    - 'online': Future - adaptive dispatch based on real-time statistics"""
+
+    ##################
     # Context Parallel
     ##################
     cp_comm_type: Optional[Union[str, List[str]]] = None
@@ -1057,6 +1082,32 @@ class TransformerConfig(ModelParallelConfig):
             ]:
                 raise ValueError(
                     f"moe_shared_expert_overlap only works with alltoall token dispatcher."
+                )
+
+        # EPLB validation
+        if self.moe_enable_eplb:
+            if self.moe_num_redundant_experts_per_rank <= 0:
+                raise ValueError(
+                    "moe_num_redundant_experts_per_rank must be > 0 when moe_enable_eplb is True"
+                )
+            if self.expert_model_parallel_size <= 1:
+                raise ValueError(
+                    "EPLB requires expert_model_parallel_size > 1"
+                )
+            if self.moe_eplb_placement_strategy not in ["random", "online"]:
+                raise ValueError(
+                    f"Invalid moe_eplb_placement_strategy: {self.moe_eplb_placement_strategy}. "
+                    "Options are 'random', 'online'."
+                )
+            if self.moe_eplb_dispatch_strategy not in ["random", "online"]:
+                raise ValueError(
+                    f"Invalid moe_eplb_dispatch_strategy: {self.moe_eplb_dispatch_strategy}. "
+                    "Options are 'random', 'online'."
+                )
+            if self.moe_token_dispatcher_type not in ["alltoall", "flex"]:
+                raise ValueError(
+                    f"EPLB only works with alltoall or flex token dispatcher, "
+                    f"but got {self.moe_token_dispatcher_type}"
                 )
 
         if isinstance(self.moe_router_load_balancing_type, list):
