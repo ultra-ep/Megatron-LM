@@ -779,6 +779,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
                     for gbuf_range_map in gbuf_range_map_for_all_buckets:
                         for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                            # Skip EPLB replica parameters - they don't have optimizer states
+                            if getattr(model_param, 'is_eplb_replica', False):
+                                continue
 
                             # Get parameter ordering information (see method docstring
                             # for details).
@@ -955,6 +958,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                     bucket_state = []
                     for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                        # Skip EPLB replica parameters - they don't have optimizer states
+                        if getattr(model_param, 'is_eplb_replica', False):
+                            continue
                         tensors = self._get_main_param_and_optimizer_states(model_param)
                         tensors.update(
                             {
@@ -1053,6 +1059,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Build contiguous DP rank shards (for param + optim states).
                         for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                            # Skip EPLB replica parameters - they don't have optimizer states
+                            if getattr(model_param, 'is_eplb_replica', False):
+                                continue
                             tensors = self._get_main_param_and_optimizer_states(model_param)
 
                             # Copy states into contiguous shard.
@@ -1467,6 +1476,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     param_world_end,
                     _,
                 ) in buffer.param_index_map.items():
+                    # Skip EPLB replica parameters - they don't have optimizer states
+                    if getattr(model_param, 'is_eplb_replica', False):
+                        continue
                     try:
                         sharded_metadata = param_to_sharded_metadata[model_param]
                     except KeyError as e:
@@ -1746,6 +1758,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
                 for gbuf_range_map in gbuf_range_map_for_all_buckets:
                     for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                        # Skip EPLB replica parameters - they don't have optimizer states
+                        if getattr(model_param, 'is_eplb_replica', False):
+                            continue
                         param_range = param_range_map['param']
                         tensors = _get_param_state_sharded_tensors(
                             model_param, slice(param_range.start, param_range.end)
@@ -1778,12 +1793,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         if not bucket_state_elem['padding']
                     ]
 
-                    assert len(bucket_state) == len(gbuf_range_map["param_map"]), (
+                    # Filter out EPLB replica params (they're not in checkpoint)
+                    non_replica_params = [
+                        (model_param, param_range_map)
+                        for model_param, param_range_map in gbuf_range_map["param_map"].items()
+                        if not getattr(model_param, 'is_eplb_replica', False)
+                    ]
+
+                    assert len(bucket_state) == len(non_replica_params), (
                         len(bucket_state),
-                        len(gbuf_range_map["param_map"]),
+                        len(non_replica_params),
                     )
                     for src_tensors, (model_param, param_range_map) in zip(
-                        bucket_state, gbuf_range_map["param_map"].items()
+                        bucket_state, non_replica_params
                     ):
                         # Main param & optimizer states.
                         self._set_main_param_and_optimizer_states(model_param, src_tensors)
@@ -1799,6 +1821,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
                 for gbuf_range_map in gbuf_range_map_for_all_buckets:
                     for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                        # Skip EPLB replica parameters - they're not in checkpoint
+                        if getattr(model_param, 'is_eplb_replica', False):
+                            continue
                         src_tensors = {}
                         for k, v in state_dict[param_idx].items():
                             if k == "step":
@@ -1928,6 +1953,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Copy local contiguous shards to param/optim shards.
                         for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                            # Skip EPLB replica parameters - they don't have optimizer states
+                            if getattr(model_param, 'is_eplb_replica', False):
+                                continue
 
                             # Main param & optimizer states.
                             group_index, group_order = self.model_param_group_index_map[model_param]
@@ -2049,6 +2077,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             ]
 
                 for model_param, tensors in recv_tensors.items():
+                    # Skip EPLB replica parameters - they don't have optimizer states
+                    if getattr(model_param, 'is_eplb_replica', False):
+                        continue
                     self._set_main_param_and_optimizer_states(model_param, tensors)
 
     @torch.no_grad()
@@ -2077,6 +2108,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for model_param, (param_world_start, param_world_end, _) in self.buffers[
                     gbuf_idx
                 ].param_index_map.items():
+                    # Skip EPLB replica parameters - they don't have optimizer states
+                    if getattr(model_param, 'is_eplb_replica', False):
+                        continue
                     param_idx += 1  # increment even if skip param update
                     if model_param not in all_buckets_param_range_map:
                         continue
