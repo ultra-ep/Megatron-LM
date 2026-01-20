@@ -876,6 +876,33 @@ class TEGroupedMLP(MegatronModule):
                     if replica_bias is not None:
                         setattr(replica_bias, 'is_eplb_replica', True)
 
+    def _init_eplb_index_mappings(self):
+        """Pre-compute index mappings as GPU tensors to avoid ALL D2H transfers.
+        
+        This stores slices of the physical_to_logical_map as GPU tensors, which can
+        be used for advanced indexing (index_copy_, index_select) during backward.
+        """
+        if not self.eplb_manager._placement_initialized:
+            return
+        
+        ep_rank = self.eplb_manager.ep_rank
+        num_local_master = self.eplb_manager.num_local_master_experts
+        num_redundant = self.eplb_manager.num_redundant_per_rank
+        num_local_physical = self.eplb_manager.num_local_physical_experts
+        
+        # Keep as GPU tensor
+        physical_to_logical = self.eplb_manager.placement.physical_to_logical_map
+        
+        # Pre-compute replica logical indices: GPU tensor [num_redundant]
+        replica_start = ep_rank * num_local_physical + num_local_master
+        replica_end = replica_start + num_redundant
+        self._eplb_replica_logical_indices = physical_to_logical[replica_start:replica_end].long()
+        
+        # Pre-compute master logical indices: GPU tensor [num_local_master]
+        master_start = ep_rank * num_local_physical
+        master_end = master_start + num_local_master
+        self._eplb_master_logical_indices = physical_to_logical[master_start:master_end].long()
+        
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
@@ -1136,8 +1163,13 @@ class TEGroupedMLP(MegatronModule):
         current microbatch. It initiates async communication that can overlap with 
         subsequent backward computation.
         
-        With gradient_accumulation_fusion enabled, gradients are in main_grad.
+        With gradient_accumulation_fusion enabled (default), gradients are in main_grad.
         Without fusion, gradients are in param.grad (copied to main_grad by DDP hooks).
+        
+        Performance optimizations:
+        - ZERO D2H/H2D: Uses GPU tensors for all index mapping operations
+        - Tensorized movement: Uses index_copy_ to fill global buffers on GPU
+        - Minimized Python overhead: Bulk moves replica gradients in one op
         
         Args:
             async_op: If True, return immediately with async handle. If False, block.
@@ -1151,21 +1183,19 @@ class TEGroupedMLP(MegatronModule):
         if not self.eplb_manager._placement_initialized:
             return None
         
+        # Initialize index mappings on first call
+        self._init_eplb_index_mappings()
+        
         ep_group = self.eplb_manager.ep_group
-        ep_rank = self.eplb_manager.ep_rank
         num_local_master = self.eplb_manager.num_local_master_experts
         num_redundant = self.eplb_manager.num_redundant_per_rank
-        num_local_physical = self.eplb_manager.num_local_physical_experts
         num_global_logical = self.eplb_manager.num_global_logical_experts
         
         if num_redundant == 0:
             return None
         
-        physical_to_logical = self.eplb_manager.placement.physical_to_logical_map
-        
         # Collect all buffers for async reduction
         buffers_to_reduce = []
-        buffer_metadata = []  # Store (linear_module, param_type, shape) for finish step
         
         # Process each linear layer (fc1 and fc2)
         for layer_name, linear_module in [('fc1', self.linear_fc1), ('fc2', self.linear_fc2)]:
@@ -1185,26 +1215,29 @@ class TEGroupedMLP(MegatronModule):
                     device=device,
                 )
             global_weight_contrib = self._eplb_grad_buffers[buffer_key]
+            # TODO: use bulked zero-out
             global_weight_contrib.zero_()
             
-            # Place local replica gradients at their logical expert positions
-            for replica_idx in range(num_redundant):
-                local_physical_idx = num_local_master + replica_idx
-                global_physical_idx = ep_rank * num_local_physical + local_physical_idx
-                
-                replica_weight = getattr(linear_module, f'weight{local_physical_idx}')
+            # Bulk collect replica gradients
+            replica_grads = []
+            for i in range(num_redundant):
+                replica_weight = getattr(linear_module, f'weight{num_local_master + i}')
                 replica_grad = self._get_param_grad(replica_weight)
-                if replica_grad is None:
-                    continue
-                
-                logical_idx = physical_to_logical[global_physical_idx].item()
-                global_weight_contrib[logical_idx].add_(replica_grad.to(grad_dtype))
-                
-                # Zero replica gradient to prevent duplicate accumulation
-                self._zero_param_grad(replica_weight)
+                if replica_grad is not None:
+                    replica_grads.append(replica_grad.to(grad_dtype))
+                    # TODO: use bulked zero-out
+                    self._zero_param_grad(replica_weight)
+                else:
+                    replica_grads.append(torch.zeros_like(ref_weight, dtype=grad_dtype))
+            
+            # Fully on GPU: index_copy_ moves all replica gradients at once
+            if len(replica_grads) > 0:
+                all_replica_grads = torch.stack(replica_grads)
+                global_weight_contrib.index_copy_(
+                    0, self._eplb_replica_logical_indices, all_replica_grads
+                )
             
             buffers_to_reduce.append(global_weight_contrib)
-            buffer_metadata.append((linear_module, 'weight', weight_shape))
             
             # Handle bias if present
             if self.config.add_bias_linear:
@@ -1222,28 +1255,27 @@ class TEGroupedMLP(MegatronModule):
                     global_bias_contrib = self._eplb_grad_buffers[buffer_key]
                     global_bias_contrib.zero_()
                     
-                    for replica_idx in range(num_redundant):
-                        local_physical_idx = num_local_master + replica_idx
-                        global_physical_idx = ep_rank * num_local_physical + local_physical_idx
-                        
-                        replica_bias = getattr(linear_module, f'bias{local_physical_idx}', None)
+                    replica_bias_grads = []
+                    for i in range(num_redundant):
+                        replica_bias = getattr(linear_module, f'bias{num_local_master + i}', None)
                         if replica_bias is not None:
                             replica_grad = self._get_param_grad(replica_bias)
                             if replica_grad is not None:
-                                logical_idx = physical_to_logical[global_physical_idx].item()
-                                global_bias_contrib[logical_idx].add_(replica_grad.to(grad_dtype))
+                                replica_bias_grads.append(replica_grad.to(grad_dtype))
                                 self._zero_param_grad(replica_bias)
+                            else:
+                                replica_bias_grads.append(torch.zeros_like(ref_bias, dtype=grad_dtype))
+                    
+                    if len(replica_bias_grads) > 0:
+                        all_replica_bias_grads = torch.stack(replica_bias_grads)
+                        global_bias_contrib.index_copy_(
+                            0, self._eplb_replica_logical_indices, all_replica_bias_grads
+                        )
                     
                     buffers_to_reduce.append(global_bias_contrib)
-                    buffer_metadata.append((linear_module, 'bias', bias_shape))
-        
-        # Store metadata for finish step
-        self._eplb_buffer_metadata = buffer_metadata
         
         # Start async all-reduce for all buffers
-        # Use a flat buffer for efficiency
         if len(buffers_to_reduce) > 0:
-            # Coalesce into single all-reduce for efficiency
             handles = []
             for buf in buffers_to_reduce:
                 handle = torch.distributed.all_reduce(
@@ -1263,6 +1295,9 @@ class TEGroupedMLP(MegatronModule):
         
         This waits for the async all-reduce to complete and adds the aggregated
         replica gradient contributions to the corresponding master expert gradients.
+        
+        Uses ZERO D2H/H2D optimizations:
+        - index_select gathers all master contributions at once on GPU
         """
         if not self.eplb_enabled or self.eplb_manager is None:
             return
@@ -1276,112 +1311,94 @@ class TEGroupedMLP(MegatronModule):
                 handle.wait()
         self._eplb_replica_grad_reduce_handle = None
         
-        ep_rank = self.eplb_manager.ep_rank
         num_local_master = self.eplb_manager.num_local_master_experts
-        num_local_physical = self.eplb_manager.num_local_physical_experts
-        physical_to_logical = self.eplb_manager.placement.physical_to_logical_map
         
         # Process stored buffers and add to master gradients
-        buffer_idx = 0
         for layer_name, linear_module in [('fc1', self.linear_fc1), ('fc2', self.linear_fc2)]:
             # Weight gradients
             buffer_key = f'{layer_name}_weight'
             if buffer_key in self._eplb_grad_buffers:
                 global_weight_contrib = self._eplb_grad_buffers[buffer_key]
+                # Fully on GPU: gather all local master contributions at once
+                master_contribs = global_weight_contrib.index_select(
+                    0, self._eplb_master_logical_indices
+                )
                 
-                for local_idx in range(num_local_master):
-                    global_physical_idx = ep_rank * num_local_physical + local_idx
-                    logical_idx = physical_to_logical[global_physical_idx].item()
-                    
-                    master_weight = getattr(linear_module, f'weight{local_idx}')
+                for i in range(num_local_master):
+                    master_weight = getattr(linear_module, f'weight{i}')
                     master_grad = self._get_param_grad(master_weight)
                     if master_grad is not None:
-                        master_grad.add_(global_weight_contrib[logical_idx].to(master_grad.dtype))
+                        master_grad.add_(master_contribs[i].to(master_grad.dtype))
             
             # Bias gradients
             if self.config.add_bias_linear:
                 buffer_key = f'{layer_name}_bias'
                 if buffer_key in self._eplb_grad_buffers:
                     global_bias_contrib = self._eplb_grad_buffers[buffer_key]
+                    master_bias_contribs = global_bias_contrib.index_select(
+                        0, self._eplb_master_logical_indices
+                    )
                     
-                    for local_idx in range(num_local_master):
-                        global_physical_idx = ep_rank * num_local_physical + local_idx
-                        logical_idx = physical_to_logical[global_physical_idx].item()
-                        
-                        master_bias = getattr(linear_module, f'bias{local_idx}', None)
+                    for i in range(num_local_master):
+                        master_bias = getattr(linear_module, f'bias{i}', None)
                         if master_bias is not None:
                             master_grad = self._get_param_grad(master_bias)
                             if master_grad is not None:
-                                master_grad.add_(global_bias_contrib[logical_idx].to(master_grad.dtype))
+                                master_grad.add_(master_bias_contribs[i].to(master_grad.dtype))
 
     def aggregate_replica_gradients_with_master(self):
         """Aggregate gradients from replica experts to their source originals (sync version).
         
         This is a synchronous wrapper around start/finish_replica_grad_reduce for
-        compatibility with existing code paths (e.g., backward_dw with delay_wgrad_compute).
-        
-        For async overlap with backward computation, use start_replica_grad_reduce() and
-        finish_replica_grad_reduce() separately with backward hooks.
+        compatibility with existing code paths. Optimized to be fully on GPU.
         """
         self.start_replica_grad_reduce(async_op=False)
-        # With async_op=False, communication is already complete, but we still need
-        # to add contributions to master gradients
-        if self.eplb_enabled and self.eplb_manager is not None:
-            ep_rank = self.eplb_manager.ep_rank
-            num_local_master = self.eplb_manager.num_local_master_experts
-            num_local_physical = self.eplb_manager.num_local_physical_experts
-            num_redundant = self.eplb_manager.num_redundant_per_rank
+        # Manually trigger the aggregation part of finish_replica_grad_reduce
+        if not self.eplb_enabled or self.eplb_manager is None:
+            return
             
-            if num_redundant == 0:
-                return
-                
-            if not self.eplb_manager._placement_initialized:
-                return
-                
-            physical_to_logical = self.eplb_manager.placement.physical_to_logical_map
+        num_local_master = self.eplb_manager.num_local_master_experts
+        num_redundant = self.eplb_manager.num_redundant_per_rank
+        
+        if num_redundant == 0 or not self.eplb_manager._placement_initialized:
+            return
             
-            for layer_name, linear_module in [('fc1', self.linear_fc1), ('fc2', self.linear_fc2)]:
-                buffer_key = f'{layer_name}_weight'
+        for layer_name, linear_module in [('fc1', self.linear_fc1), ('fc2', self.linear_fc2)]:
+            buffer_key = f'{layer_name}_weight'
+            if buffer_key in self._eplb_grad_buffers:
+                global_weight_contrib = self._eplb_grad_buffers[buffer_key]
+                master_contribs = global_weight_contrib.index_select(
+                    0, self._eplb_master_logical_indices
+                )
+                for i in range(num_local_master):
+                    master_weight = getattr(linear_module, f'weight{i}')
+                    master_grad = self._get_param_grad(master_weight)
+                    if master_grad is not None:
+                        master_grad.add_(master_contribs[i].to(master_grad.dtype))
+            
+            if self.config.add_bias_linear:
+                buffer_key = f'{layer_name}_bias'
                 if buffer_key in self._eplb_grad_buffers:
-                    global_weight_contrib = self._eplb_grad_buffers[buffer_key]
-                    
-                    for local_idx in range(num_local_master):
-                        global_physical_idx = ep_rank * num_local_physical + local_idx
-                        logical_idx = physical_to_logical[global_physical_idx].item()
-                        
-                        master_weight = getattr(linear_module, f'weight{local_idx}')
-                        master_grad = self._get_param_grad(master_weight)
-                        if master_grad is not None:
-                            master_grad.add_(global_weight_contrib[logical_idx].to(master_grad.dtype))
-                
-                if self.config.add_bias_linear:
-                    buffer_key = f'{layer_name}_bias'
-                    if buffer_key in self._eplb_grad_buffers:
-                        global_bias_contrib = self._eplb_grad_buffers[buffer_key]
-                        
-                        for local_idx in range(num_local_master):
-                            global_physical_idx = ep_rank * num_local_physical + local_idx
-                            logical_idx = physical_to_logical[global_physical_idx].item()
-                            
-                            master_bias = getattr(linear_module, f'bias{local_idx}', None)
-                            if master_bias is not None:
-                                master_grad = self._get_param_grad(master_bias)
-                                if master_grad is not None:
-                                    master_grad.add_(global_bias_contrib[logical_idx].to(master_grad.dtype))
+                    global_bias_contrib = self._eplb_grad_buffers[buffer_key]
+                    master_bias_contribs = global_bias_contrib.index_select(
+                        0, self._eplb_master_logical_indices
+                    )
+                    for i in range(num_local_master):
+                        master_bias = getattr(linear_module, f'bias{i}', None)
+                        if master_bias is not None:
+                            master_grad = self._get_param_grad(master_bias)
+                            if master_grad is not None:
+                                master_grad.add_(master_bias_contribs[i].to(master_grad.dtype))
 
     def synchronize_replica_weights_with_master(self):
         """Synchronize replica weights from their source originals.
-        This will refresh all replica weights to source master experts, and should be
-        used after optimizer step or start training.
-        *There will be more efficient impl for online weight updating for redundant experts.
         
-        For TEGroupedMLP, weights are stored in linear_fc1 and linear_fc2 modules.
-        Each module has weight parameters named weight0, weight1, ..., weight{n-1}.
-        This method synchronizes replica weights from original experts after optimizer step.
+        This will refresh all replica weights from source master experts. Should be
+        used after optimizer step or start of training.
         
-        The algorithm:
-        1. Stack local master weights and all-gather across EP ranks
-        2. For each local replica, find its source master and copy weights
+        Performance optimizations:
+        - ZERO D2H/H2D: All index math and copies happen on GPU
+        - Bulk movement: Uses advanced indexing to copy all replica weights at once
         """
         if not self.eplb_enabled or self.eplb_manager is None:
             return
@@ -1402,40 +1419,50 @@ class TEGroupedMLP(MegatronModule):
         physical_to_logical = self.eplb_manager.placement.physical_to_logical_map
         logical_to_physical = self.eplb_manager.placement.logical_to_physical_map
         
+        # Pre-compute source coordinates for all local replicas on GPU
+        replica_start = ep_rank * num_local_physical + num_local_master
+        replica_end = replica_start + num_redundant
+        replica_logical_indices = physical_to_logical[replica_start:replica_end].long()
+        
+        # First entry in logical_to_physical is always the master expert
+        master_physical_indices = logical_to_physical[replica_logical_indices, 0].long()
+        
+        source_ranks = master_physical_indices // num_local_physical
+        source_local_indices = master_physical_indices % num_local_physical
+        
         # Process each linear layer (fc1 and fc2)
         for linear_module in [self.linear_fc1, self.linear_fc2]:
-            # Stack local master weights
+            # 1. Stack local master weights and gather
             master_weights = torch.stack([
                 getattr(linear_module, f'weight{i}').data 
                 for i in range(num_local_master)
             ], dim=0)
             
-            # All-gather master weights from all ranks
-            # Shape: [ep_size, num_local_master, ...]
             gathered_list = [torch.empty_like(master_weights) for _ in range(ep_size)]
             torch.distributed.all_gather(gathered_list, master_weights, group=ep_group)
             all_master_weights = torch.stack(gathered_list, dim=0)
             
-            # For each local replica, find its source master and copy weights
-            for replica_idx in range(num_redundant):
-                local_physical_idx = num_local_master + replica_idx
-                global_physical_idx = ep_rank * num_local_physical + local_physical_idx
-                
-                # Get logical expert this replica represents
-                logical_idx = physical_to_logical[global_physical_idx].item()
-                
-                # Get master physical index (first entry in logical_to_physical is the master)
-                master_physical_idx = logical_to_physical[logical_idx, 0].item()
-                
-                # Compute source rank and local index from master physical index
-                source_rank = master_physical_idx // num_local_physical
-                source_local_idx = master_physical_idx % num_local_physical
-                
-                # Copy weights from source master to replica
-                replica_weight = getattr(linear_module, f'weight{local_physical_idx}')
-                replica_weight.data.copy_(all_master_weights[source_rank, source_local_idx])
+            # 2. Bulk copy all replica weights at once using advanced indexing
+            # Collect replica weight references
+            replica_weights_ref = [
+                getattr(linear_module, f'weight{num_local_master + i}')
+                for i in range(num_redundant)
+            ]
             
-            # Also handle bias if present
+            # Create a single view of all local replica weights for the bulk copy
+            # We use stack to create a temporary buffer for the copy operation
+            # then copy back to individual parameters. 
+            # *In a future refactor, TEGroupedLinear could use a single weight tensor.
+            all_local_replicas = torch.stack([w.data for w in replica_weights_ref])
+            
+            # GPU-to-GPU advanced indexing copy
+            all_local_replicas.copy_(all_master_weights[source_ranks, source_local_indices])
+            
+            # Copy back from stacked buffer to individual parameters
+            for i, w in enumerate(replica_weights_ref):
+                w.data.copy_(all_local_replicas[i])
+            
+            # 3. Handle bias if present
             if self.config.add_bias_linear:
                 ref_bias = getattr(linear_module, 'bias0', None)
                 if ref_bias is not None:
@@ -1448,19 +1475,16 @@ class TEGroupedMLP(MegatronModule):
                     torch.distributed.all_gather(gathered_bias_list, master_biases, group=ep_group)
                     all_master_biases = torch.stack(gathered_bias_list, dim=0)
                     
-                    for replica_idx in range(num_redundant):
-                        local_physical_idx = num_local_master + replica_idx
-                        global_physical_idx = ep_rank * num_local_physical + local_physical_idx
-                        
-                        logical_idx = physical_to_logical[global_physical_idx].item()
-                        master_physical_idx = logical_to_physical[logical_idx, 0].item()
-                        
-                        source_rank = master_physical_idx // num_local_physical
-                        source_local_idx = master_physical_idx % num_local_physical
-                        
-                        replica_bias = getattr(linear_module, f'bias{local_physical_idx}', None)
-                        if replica_bias is not None:
-                            replica_bias.data.copy_(all_master_biases[source_rank, source_local_idx])
+                    replica_biases_ref = [
+                        getattr(linear_module, f'bias{num_local_master + i}')
+                        for i in range(num_redundant)
+                    ]
+                    
+                    all_local_replica_biases = torch.stack([b.data for b in replica_biases_ref])
+                    all_local_replica_biases.copy_(all_master_biases[source_ranks, source_local_indices])
+                    
+                    for i, b in enumerate(replica_biases_ref):
+                        b.data.copy_(all_local_replica_biases[i])
 
 
 class SequentialMLP(MegatronModule):
