@@ -37,6 +37,53 @@ except ImportError:
     HAVE_TE = False
 
 
+class _EPLBReplicaGradReduceFunction(torch.autograd.Function):
+    """Autograd function to trigger EPLB replica gradient reduction during backward.
+    
+    This function wraps the MoE INPUT (not output) so that its backward fires AFTER
+    the MoE layer's backward is complete. The backward execution order is:
+    
+    Forward:  input → [wrap] → MoE forward → output
+    Backward: output_grad → MoE backward → [wrap backward] → input_grad
+    
+    By wrapping the input, the wrapper's backward fires after MoE backward completes,
+    which means replica gradients are already in main_grad and ready for reduction.
+    
+    The reduction happens for EVERY microbatch (unlike DDP which only reduces on
+    the last microbatch) because replica gradients must be aggregated to master
+    experts immediately for correct gradient accumulation.
+    """
+    
+    @staticmethod
+    def forward(ctx, hidden_states, moe_layer):
+        """Forward pass: save moe_layer reference and pass through input."""
+        ctx.moe_layer = moe_layer
+        return hidden_states
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: trigger EPLB replica gradient reduction.
+        
+        This fires AFTER the MoE layer's backward is complete because we wrap the input.
+        At this point, replica gradients are already computed and in main_grad.
+        """
+        moe_layer = ctx.moe_layer
+        
+        if moe_layer.eplb_enabled and moe_layer.eplb_manager is not None:
+            # Start async replica gradient reduction
+            # The reduction will overlap with subsequent backward computation
+            moe_layer.start_eplb_replica_grad_reduce(async_op=True)
+            
+            # For correctness, we need to finish the reduction before gradients are used.
+            # We finish immediately here because the next layer's backward may start
+            # before we have another opportunity to finish.
+            # TODO: For better overlap, consider finishing at a later point
+            # (e.g., end of full backward pass or before optimizer step)
+            moe_layer.finish_eplb_replica_grad_reduce()
+        
+        return grad_output, None
+
+
 @dataclass
 class MoESubmodules:
     """MoE Layer Submodule spec"""
@@ -208,6 +255,9 @@ class MoELayer(BaseMoELayer):
             assert isinstance(self.experts, TEGroupedMLP), \
                 f"experts must be a TEGroupedMLP when EPLB is enabled, but got {type(self.experts)}"
             self.experts.synchronize_replica_weights_with_master()
+            # Note: EPLB backward hooks will be registered lazily in forward() after
+            # the first forward pass, because hook registration requires grad_fn which
+            # is only available after a forward pass creates the autograd graph.
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -360,6 +410,14 @@ class MoELayer(BaseMoELayer):
             output = self.combine(output, shared_expert_output)
             return output, mlp_bias
 
+        # EPLB: Wrap input with autograd function to trigger replica gradient reduction
+        # during backward pass. By wrapping the INPUT, the wrapper's backward fires AFTER
+        # the MoE layer's backward is complete (when gradients are in main_grad).
+        # This ensures replica gradients are reduced after each microbatch's backward
+        # (not just the last one like DDP overlap_grad_reduce).
+        if self.eplb_enabled:
+            hidden_states = _EPLBReplicaGradReduceFunction.apply(hidden_states, self)
+
         if self.moe_layer_recompute:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
@@ -379,15 +437,76 @@ class MoELayer(BaseMoELayer):
     def backward_dw(self):
         """Compute weight gradients for experts and shared experts.
         
-        When EPLB is enabled, this also aggregates gradients from replica
-        experts to their source (master) experts.
+        When delay_wgrad_compute is disabled (DEFAULT):
+        - This method is never called
+        - Weight gradients are computed during normal autograd backward
+        - EPLB replica gradient aggregation should use async hooks instead
+          (call finish_eplb_replica_grad_reduce after backward)
+        
+        When delay_wgrad_compute is enabled:
+        - This method computes deferred weight gradients
+        - EPLB replica gradient aggregation happens here (sync)
         """
         self.experts.backward_dw()
         if self.use_shared_expert and not self.shared_expert_overlap:
             self.shared_experts.backward_dw()
         
         # EPLB: aggregate replica gradients to source experts
+        # Only do this in backward_dw when delay_wgrad_compute is enabled
+        # Otherwise, use async hooks (start_eplb_replica_grad_reduce/finish_eplb_replica_grad_reduce)
         if self.eplb_enabled and self.eplb_manager is not None:
+            self.experts.aggregate_replica_gradients_with_master()
+    
+    def start_eplb_replica_grad_reduce(self, async_op: bool = True):
+        """Start async all-reduce of replica gradients to master experts.
+        
+        This should be called after the MoE backward pass for each microbatch.
+        It initiates async communication that can overlap with subsequent 
+        computation (e.g., next layer's backward or next microbatch's forward).
+        
+        Unlike the DDP gradient reduce/reduce-scatter which only runs on the last
+        microbatch, EPLB replica reduction runs on every microbatch because
+        replica gradients must be aggregated to masters immediately.
+        
+        Args:
+            async_op: If True, return immediately with async handle.
+            
+        Returns:
+            Communication handles if async_op=True, else None
+        """
+        if not self.eplb_enabled or self.eplb_manager is None:
+            return None
+        
+        if isinstance(self.experts, TEGroupedMLP):
+            return self.experts.start_replica_grad_reduce(async_op=async_op)
+        return None
+    
+    def finish_eplb_replica_grad_reduce(self):
+        """Finish async replica gradient reduction and add to master gradients.
+        
+        This should be called after start_eplb_replica_grad_reduce() to complete
+        the async communication and add aggregated replica gradients to masters.
+        
+        Must be called before:
+        - The next forward pass that uses the gradients
+        - The optimizer step
+        """
+        if not self.eplb_enabled or self.eplb_manager is None:
+            return
+        
+        if isinstance(self.experts, TEGroupedMLP):
+            self.experts.finish_replica_grad_reduce()
+    
+    def eplb_replica_grad_reduce_sync(self):
+        """Synchronously reduce replica gradients to master experts.
+        
+        This is a convenience method that performs the full replica gradient
+        reduction synchronously. Use start/finish methods for async operation.
+        """
+        if not self.eplb_enabled or self.eplb_manager is None:
+            return
+        
+        if isinstance(self.experts, TEGroupedMLP):
             self.experts.aggregate_replica_gradients_with_master()
 
     def set_for_recompute_pre_mlp_layernorm(self):
