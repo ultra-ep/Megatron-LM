@@ -870,12 +870,6 @@ class TEGroupedMLP(MegatronModule):
                 if replica_weight is not None:
                     setattr(replica_weight, 'is_eplb_replica', True)
                 
-                # Mark bias parameter if present
-                if self.config.add_bias_linear:
-                    replica_bias = getattr(linear_module, f'bias{local_physical_idx}', None)
-                    if replica_bias is not None:
-                        setattr(replica_bias, 'is_eplb_replica', True)
-
     def _init_eplb_index_mappings(self):
         """Pre-compute index mappings as GPU tensors to avoid ALL D2H transfers.
         
@@ -1238,56 +1232,18 @@ class TEGroupedMLP(MegatronModule):
                 )
             
             buffers_to_reduce.append(global_weight_contrib)
-            
-            # Handle bias if present
-            if self.config.add_bias_linear:
-                ref_bias = getattr(linear_module, 'bias0', None)
-                if ref_bias is not None:
-                    bias_shape = ref_bias.shape
-                    
-                    buffer_key = f'{layer_name}_bias'
-                    if buffer_key not in self._eplb_grad_buffers:
-                        self._eplb_grad_buffers[buffer_key] = torch.zeros(
-                            (num_global_logical, *bias_shape),
-                            dtype=grad_dtype,
-                            device=device,
-                        )
-                    global_bias_contrib = self._eplb_grad_buffers[buffer_key]
-                    global_bias_contrib.zero_()
-                    
-                    replica_bias_grads = []
-                    for i in range(num_redundant):
-                        replica_bias = getattr(linear_module, f'bias{num_local_master + i}', None)
-                        if replica_bias is not None:
-                            replica_grad = self._get_param_grad(replica_bias)
-                            if replica_grad is not None:
-                                replica_bias_grads.append(replica_grad.to(grad_dtype))
-                                self._zero_param_grad(replica_bias)
-                            else:
-                                replica_bias_grads.append(torch.zeros_like(ref_bias, dtype=grad_dtype))
-                    
-                    if len(replica_bias_grads) > 0:
-                        all_replica_bias_grads = torch.stack(replica_bias_grads)
-                        global_bias_contrib.index_copy_(
-                            0, self._eplb_replica_logical_indices, all_replica_bias_grads
-                        )
-                    
-                    buffers_to_reduce.append(global_bias_contrib)
         
         # Start async all-reduce for all buffers
         if len(buffers_to_reduce) > 0:
-            handles = []
-            for buf in buffers_to_reduce:
-                handle = torch.distributed.all_reduce(
-                    buf, group=ep_group, async_op=async_op
-                )
-                if async_op:
-                    handles.append(handle)
+            with torch.distributed._coalescing_manager(ep_group, async_ops=async_op) as cm:
+                for buf in buffers_to_reduce:
+                    torch.distributed.all_reduce(
+                        buf, group=ep_group, async_op=async_op
+                    )
             
             if async_op:
-                self._eplb_replica_grad_reduce_handle = handles
-                return handles
-        
+                self._eplb_replica_grad_reduce_handle = cm
+                return cm
         return None
     
     def finish_replica_grad_reduce(self):
@@ -1302,14 +1258,10 @@ class TEGroupedMLP(MegatronModule):
         if not self.eplb_enabled or self.eplb_manager is None:
             return
         
-        if self._eplb_replica_grad_reduce_handle is None:
-            return
-        
-        # Wait for all async operations to complete
-        for handle in self._eplb_replica_grad_reduce_handle:
-            if handle is not None:
-                handle.wait()
-        self._eplb_replica_grad_reduce_handle = None
+        if self._eplb_replica_grad_reduce_handle is not None:
+            # Wait for all async operations to complete
+            self._eplb_replica_grad_reduce_handle.wait()
+            self._eplb_replica_grad_reduce_handle = None
         
         num_local_master = self.eplb_manager.num_local_master_experts
         
@@ -1330,66 +1282,6 @@ class TEGroupedMLP(MegatronModule):
                     if master_grad is not None:
                         master_grad.add_(master_contribs[i].to(master_grad.dtype))
             
-            # Bias gradients
-            if self.config.add_bias_linear:
-                buffer_key = f'{layer_name}_bias'
-                if buffer_key in self._eplb_grad_buffers:
-                    global_bias_contrib = self._eplb_grad_buffers[buffer_key]
-                    master_bias_contribs = global_bias_contrib.index_select(
-                        0, self._eplb_master_logical_indices
-                    )
-                    
-                    for i in range(num_local_master):
-                        master_bias = getattr(linear_module, f'bias{i}', None)
-                        if master_bias is not None:
-                            master_grad = self._get_param_grad(master_bias)
-                            if master_grad is not None:
-                                master_grad.add_(master_bias_contribs[i].to(master_grad.dtype))
-
-    def aggregate_replica_gradients_with_master(self):
-        """Aggregate gradients from replica experts to their source originals (sync version).
-        
-        This is a synchronous wrapper around start/finish_replica_grad_reduce for
-        compatibility with existing code paths. Optimized to be fully on GPU.
-        """
-        self.start_replica_grad_reduce(async_op=False)
-        # Manually trigger the aggregation part of finish_replica_grad_reduce
-        if not self.eplb_enabled or self.eplb_manager is None:
-            return
-            
-        num_local_master = self.eplb_manager.num_local_master_experts
-        num_redundant = self.eplb_manager.num_redundant_per_rank
-        
-        if num_redundant == 0 or not self.eplb_manager._placement_initialized:
-            return
-            
-        for layer_name, linear_module in [('fc1', self.linear_fc1), ('fc2', self.linear_fc2)]:
-            buffer_key = f'{layer_name}_weight'
-            if buffer_key in self._eplb_grad_buffers:
-                global_weight_contrib = self._eplb_grad_buffers[buffer_key]
-                master_contribs = global_weight_contrib.index_select(
-                    0, self._eplb_master_logical_indices
-                )
-                for i in range(num_local_master):
-                    master_weight = getattr(linear_module, f'weight{i}')
-                    master_grad = self._get_param_grad(master_weight)
-                    if master_grad is not None:
-                        master_grad.add_(master_contribs[i].to(master_grad.dtype))
-            
-            if self.config.add_bias_linear:
-                buffer_key = f'{layer_name}_bias'
-                if buffer_key in self._eplb_grad_buffers:
-                    global_bias_contrib = self._eplb_grad_buffers[buffer_key]
-                    master_bias_contribs = global_bias_contrib.index_select(
-                        0, self._eplb_master_logical_indices
-                    )
-                    for i in range(num_local_master):
-                        master_bias = getattr(linear_module, f'bias{i}', None)
-                        if master_bias is not None:
-                            master_grad = self._get_param_grad(master_bias)
-                            if master_grad is not None:
-                                master_grad.add_(master_bias_contribs[i].to(master_grad.dtype))
-
     def synchronize_replica_weights_with_master(self):
         """Synchronize replica weights from their source originals.
         
@@ -1461,30 +1353,6 @@ class TEGroupedMLP(MegatronModule):
             # Copy back from stacked buffer to individual parameters
             for i, w in enumerate(replica_weights_ref):
                 w.data.copy_(all_local_replicas[i])
-            
-            # 3. Handle bias if present
-            if self.config.add_bias_linear:
-                ref_bias = getattr(linear_module, 'bias0', None)
-                if ref_bias is not None:
-                    master_biases = torch.stack([
-                        getattr(linear_module, f'bias{i}').data 
-                        for i in range(num_local_master)
-                    ], dim=0)
-                    
-                    gathered_bias_list = [torch.empty_like(master_biases) for _ in range(ep_size)]
-                    torch.distributed.all_gather(gathered_bias_list, master_biases, group=ep_group)
-                    all_master_biases = torch.stack(gathered_bias_list, dim=0)
-                    
-                    replica_biases_ref = [
-                        getattr(linear_module, f'bias{num_local_master + i}')
-                        for i in range(num_redundant)
-                    ]
-                    
-                    all_local_replica_biases = torch.stack([b.data for b in replica_biases_ref])
-                    all_local_replica_biases.copy_(all_master_biases[source_ranks, source_local_indices])
-                    
-                    for i, b in enumerate(replica_biases_ref):
-                        b.data.copy_(all_local_replica_biases[i])
 
 
 class SequentialMLP(MegatronModule):

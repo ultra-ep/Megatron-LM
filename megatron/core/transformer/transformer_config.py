@@ -1109,6 +1109,8 @@ class TransformerConfig(ModelParallelConfig):
                     f"EPLB only works with alltoall or flex token dispatcher, "
                     f"but got {self.moe_token_dispatcher_type}"
                 )
+            if self.add_bias_linear:
+                raise ValueError("EPLB does not support add_bias_linear")
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(

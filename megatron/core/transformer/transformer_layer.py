@@ -510,8 +510,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             fine_grained_offloading_group_start,
             get_fine_grained_offloading_context,
         )
+        from megatron.core.transformer.moe.moe_layer import _EPLBReplicaGradReduceFinishFunction
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if self.is_moe_layer and self.mlp.eplb_enabled:
+            hidden_states = _EPLBReplicaGradReduceFinishFunction.apply(hidden_states, self.mlp)
 
         # Residual connection.
         residual = hidden_states
