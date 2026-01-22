@@ -52,6 +52,10 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.utils import internal_api
 from megatron.core.transformer.moe.eplb.manager import EPLBManager
+from megatron.core.transformer.moe.eplb.shared_grad_buffer import (
+    get_or_create_shared_grad_buffer_manager,
+    EPLBSharedGradBufferManager,
+)
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -849,7 +853,11 @@ class TEGroupedMLP(MegatronModule):
             self._mark_replica_parameters()
             # Initialize EPLB gradient aggregation state
             self._eplb_replica_grad_reduce_handle = None
-            self._eplb_grad_buffers = {}  # Cached buffers for gradient aggregation
+            
+            # Get or create shared gradient buffer manager for EPLB replicas
+            # This is shared across all MoE layers to save memory
+            self._shared_grad_buffer_manager: Optional[EPLBSharedGradBufferManager] = None
+            self._shared_grad_buffer_initialized = False
 
     def _mark_replica_parameters(self):
         """Mark replica expert parameters with is_eplb_replica=True attribute.
@@ -868,7 +876,57 @@ class TEGroupedMLP(MegatronModule):
                 # Mark weight parameter
                 replica_weight = getattr(linear_module, f'weight{local_physical_idx}', None)
                 if replica_weight is not None:
+                    # Mark as replica for skipping optimizer state and main_grad buffer
                     setattr(replica_weight, 'is_eplb_replica', True)
+    
+    def initialize_shared_grad_buffer(self, layer_name: str = ""):
+        """Initialize shared gradient buffer for EPLB replica expert parameters.
+        
+        This method should be called after model construction is complete and before
+        training starts. It sets up a shared gradient buffer that is reused across
+        all MoE layers to save memory.
+        
+        The shared buffer manager is obtained/created once and shared across all
+        layers with the same configuration. Each layer's replica params get views
+        into this shared buffer as their main_grad.
+        
+        Args:
+            layer_name: Name of this layer for logging purposes
+        """
+        if not self.eplb_enabled or self._shared_grad_buffer_initialized:
+            return
+        
+        num_redundant = self.eplb_manager.num_redundant_per_rank
+        if num_redundant == 0:
+            self._shared_grad_buffer_initialized = True
+            return
+        
+        # Get weight shapes from first replica expert
+        num_local_master = self.eplb_manager.num_local_master_experts
+        fc1_weight = getattr(self.linear_fc1, f'weight{num_local_master}')
+        fc2_weight = getattr(self.linear_fc2, f'weight{num_local_master}')
+        
+        # Determine gradient dtype (float32 for gradient accumulation fusion)
+        grad_dtype = torch.float32 if self.config.gradient_accumulation_fusion else fc1_weight.dtype
+        
+        # Get or create shared buffer manager
+        self._shared_grad_buffer_manager = get_or_create_shared_grad_buffer_manager(
+            ep_group=self.ep_group,
+            num_redundant_per_rank=num_redundant,
+            fc1_weight_shape=fc1_weight.shape,
+            fc2_weight_shape=fc2_weight.shape,
+            grad_dtype=grad_dtype,
+        )
+        
+        # Assign main_grad to replica params from shared buffer
+        self._shared_grad_buffer_manager.assign_main_grad_to_replica_params(
+            linear_fc1=self.linear_fc1,
+            linear_fc2=self.linear_fc2,
+            num_local_master=num_local_master,
+            layer_name=layer_name,
+        )
+        
+        self._shared_grad_buffer_initialized = True
                 
     def _init_eplb_index_mappings(self):
         """Pre-compute index mappings as GPU tensors to avoid ALL D2H transfers.
@@ -1112,43 +1170,21 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1.backward_dw()
 
     def _get_param_grad(self, param: torch.nn.Parameter) -> Optional[torch.Tensor]:
-        """Get gradient from parameter, preferring main_grad over grad.
+        """Get gradient from parameter.
         
         With gradient_accumulation_fusion (default), gradients are written directly to main_grad.
         Without fusion, gradients are in param.grad and copied to main_grad by DDP hooks.
-        
-        Args:
-            param: The parameter to get gradient from
-            
-        Returns:
-            The gradient tensor (main_grad if available, else grad), or None if no gradient
         """
-        if hasattr(param, 'main_grad') and param.main_grad is not None:
-            return param.main_grad
-        return param.grad
-    
-    def _add_to_param_grad(self, param: torch.nn.Parameter, value: torch.Tensor):
-        """Add value to parameter's gradient buffer (main_grad preferred).
-        
-        Args:
-            param: The parameter whose gradient to modify
-            value: The tensor to add to the gradient
-        """
-        if hasattr(param, 'main_grad') and param.main_grad is not None:
-            param.main_grad.add_(value)
-        elif param.grad is not None:
-            param.grad.add_(value)
+        assert hasattr(param, 'main_grad') and param.main_grad is not None, "main_grad is not available"
+        return param.main_grad
     
     def _zero_param_grad(self, param: torch.nn.Parameter):
-        """Zero out parameter's gradient buffer (main_grad preferred).
-        
-        Args:
-            param: The parameter whose gradient to zero
+        """Zero out parameter's gradient buffer.
+        Note: Prefer using self._shared_grad_buffer_manager.zero_grad() for bulk zero-out,
+        instead of this method for per-parameter zero-out.
         """
-        if hasattr(param, 'main_grad') and param.main_grad is not None:
-            param.main_grad.zero_()
-        elif param.grad is not None:
-            param.grad.zero_()
+        assert hasattr(param, 'main_grad') and param.main_grad is not None, "main_grad is not available"
+        param.main_grad.zero_()
 
     def start_replica_grad_reduce(self, async_op: bool = True):
         """Start async all-reduce of replica gradients to master experts.
@@ -1157,13 +1193,12 @@ class TEGroupedMLP(MegatronModule):
         current microbatch. It initiates async communication that can overlap with 
         subsequent backward computation.
         
-        With gradient_accumulation_fusion enabled (default), gradients are in main_grad.
-        Without fusion, gradients are in param.grad (copied to main_grad by DDP hooks).
-        
         Performance optimizations:
         - ZERO D2H/H2D: Uses GPU tensors for all index mapping operations
+        - Bulk operations: Leverages shared buffer's contiguous layout for stacked grads
+        - Bulked and async zero operation: Zeros entire shared gradient buffer at once
+        - Fused buffer: Single all-reduce for both fc1 and fc2 gradients
         - Tensorized movement: Uses index_copy_ to fill global buffers on GPU
-        - Minimized Python overhead: Bulk moves replica gradients in one op
         
         Args:
             async_op: If True, return immediately with async handle. If False, block.
@@ -1181,69 +1216,50 @@ class TEGroupedMLP(MegatronModule):
         self._init_eplb_index_mappings()
         
         ep_group = self.eplb_manager.ep_group
-        num_local_master = self.eplb_manager.num_local_master_experts
         num_redundant = self.eplb_manager.num_redundant_per_rank
-        num_global_logical = self.eplb_manager.num_global_logical_experts
         
         if num_redundant == 0:
             return None
         
-        # Collect all buffers for async reduction
-        buffers_to_reduce = []
+        # Ensure shared buffer manager is available
+        if self._shared_grad_buffer_manager is None:
+            raise RuntimeError(
+                "Shared grad buffer manager not initialized. "
+                "Call initialize_shared_grad_buffer() first."
+            )
         
-        # Process each linear layer (fc1 and fc2)
-        for layer_name, linear_module in [('fc1', self.linear_fc1), ('fc2', self.linear_fc2)]:
-            # Get reference weight to determine shape and dtype
-            ref_weight = getattr(linear_module, 'weight0')
-            weight_shape = ref_weight.shape
-            # Use float32 for gradient accumulation to match main_grad dtype
-            grad_dtype = torch.float32 if self.config.gradient_accumulation_fusion else ref_weight.dtype
-            device = ref_weight.device
-            
-            # Create or reuse global buffer for weight gradient contributions
-            buffer_key = f'{layer_name}_weight'
-            if buffer_key not in self._eplb_grad_buffers:
-                self._eplb_grad_buffers[buffer_key] = torch.zeros(
-                    (num_global_logical, *weight_shape),
-                    dtype=grad_dtype,
-                    device=device,
-                )
-            global_weight_contrib = self._eplb_grad_buffers[buffer_key]
-            # TODO: use bulked zero-out
-            global_weight_contrib.zero_()
-            
-            # Bulk collect replica gradients
-            replica_grads = []
-            for i in range(num_redundant):
-                replica_weight = getattr(linear_module, f'weight{num_local_master + i}')
-                replica_grad = self._get_param_grad(replica_weight)
-                if replica_grad is not None:
-                    replica_grads.append(replica_grad.to(grad_dtype))
-                    # TODO: use bulked zero-out
-                    self._zero_param_grad(replica_weight)
-                else:
-                    replica_grads.append(torch.zeros_like(ref_weight, dtype=grad_dtype))
-            
-            # Fully on GPU: index_copy_ moves all replica gradients at once
-            if len(replica_grads) > 0:
-                all_replica_grads = torch.stack(replica_grads)
-                global_weight_contrib.index_copy_(
-                    0, self._eplb_replica_logical_indices, all_replica_grads
-                )
-            
-            buffers_to_reduce.append(global_weight_contrib)
+        # Initialize all-reduce buffer on first call
+        num_global_logical = self.eplb_manager.num_global_logical_experts
+        grad_reduce_buffer = self._shared_grad_buffer_manager.get_or_create_global_logical_experts_grad_buffer(num_global_logical)
+
+        # Zero out the shared buffer for replica gradients
+        grad_reduce_buffer.zero_()
+
+        # Get fc1 and fc2 replica gradients from shared buffer (already stacked and contiguous)
+        fc1_replica_grads = self._shared_grad_buffer_manager.get_fc1_stacked_grads()
+        fc2_replica_grads = self._shared_grad_buffer_manager.get_fc2_stacked_grads()
         
-        # Start async all-reduce for all buffers
-        if len(buffers_to_reduce) > 0:
-            with torch.distributed._coalescing_manager(ep_group, async_ops=async_op) as cm:
-                for buf in buffers_to_reduce:
-                    torch.distributed.all_reduce(
-                        buf, group=ep_group, async_op=async_op
-                    )
-            
-            if async_op:
-                self._eplb_replica_grad_reduce_handle = cm
-                return cm
+        # Flatten and concatenate fc1 and fc2 gradients: [num_redundant, fc1_numel + fc2_numel]
+        fc1_flat = fc1_replica_grads.view(num_redundant, -1)
+        fc2_flat = fc2_replica_grads.view(num_redundant, -1)
+        fused_replica_grads = torch.cat([fc1_flat, fc2_flat], dim=1)
+        
+        # Bulk index_copy_ into fused buffer
+        grad_reduce_buffer.index_copy_(
+            0, self._eplb_replica_logical_indices, fused_replica_grads
+        )
+        
+        # Start single async all-reduce for the fused buffer
+        handle = torch.distributed.all_reduce(
+            grad_reduce_buffer, group=ep_group, async_op=async_op
+        )
+        
+        # Allow overlapping of zero-out with all-reduce
+        self._shared_grad_buffer_manager.zero_grad()
+                
+        if async_op:
+            self._eplb_replica_grad_reduce_handle = handle
+            return handle
         return None
     
     def finish_replica_grad_reduce(self):
@@ -1254,33 +1270,44 @@ class TEGroupedMLP(MegatronModule):
         
         Uses ZERO D2H/H2D optimizations:
         - index_select gathers all master contributions at once on GPU
+        - Extracts fc1 and fc2 portions from fused buffer
         """
         if not self.eplb_enabled or self.eplb_manager is None:
             return
         
         if self._eplb_replica_grad_reduce_handle is not None:
-            # Wait for all async operations to complete
+            # Wait for the async all-reduce to complete
             self._eplb_replica_grad_reduce_handle.wait()
             self._eplb_replica_grad_reduce_handle = None
         
         num_local_master = self.eplb_manager.num_local_master_experts
+
+        fc1_shape = self._shared_grad_buffer_manager.fc1_weight_shape
+        fc2_shape = self._shared_grad_buffer_manager.fc2_weight_shape
+        fc1_numel = self._shared_grad_buffer_manager.fc1_numel_per_expert
         
-        # Process stored buffers and add to master gradients
-        for layer_name, linear_module in [('fc1', self.linear_fc1), ('fc2', self.linear_fc2)]:
-            # Weight gradients
-            buffer_key = f'{layer_name}_weight'
-            if buffer_key in self._eplb_grad_buffers:
-                global_weight_contrib = self._eplb_grad_buffers[buffer_key]
-                # Fully on GPU: gather all local master contributions at once
-                master_contribs = global_weight_contrib.index_select(
-                    0, self._eplb_master_logical_indices
-                )
-                
-                for i in range(num_local_master):
-                    master_weight = getattr(linear_module, f'weight{i}')
-                    master_grad = self._get_param_grad(master_weight)
-                    if master_grad is not None:
-                        master_grad.add_(master_contribs[i].to(master_grad.dtype))
+        grad_reduce_buffer = self._shared_grad_buffer_manager.get_or_create_global_logical_experts_grad_buffer()
+        
+        # Gather all local master contributions at once: [num_local_master, fc1_numel + fc2_numel]
+        master_contribs = grad_reduce_buffer.index_select(0, self._eplb_master_logical_indices)
+        
+        # Split into fc1 and fc2 portions
+        fc1_contribs = master_contribs[:, :fc1_numel].view(num_local_master, *fc1_shape)
+        fc2_contribs = master_contribs[:, fc1_numel:].view(num_local_master, *fc2_shape)
+        
+        # Add fc1 contributions to master gradients
+        for i in range(num_local_master):
+            master_weight = getattr(self.linear_fc1, f'weight{i}')
+            master_grad = self._get_param_grad(master_weight)
+            if master_grad is not None:
+                master_grad.add_(fc1_contribs[i].to(master_grad.dtype))
+        
+        # Add fc2 contributions to master gradients
+        for i in range(num_local_master):
+            master_weight = getattr(self.linear_fc2, f'weight{i}')
+            master_grad = self._get_param_grad(master_weight)
+            if master_grad is not None:
+                master_grad.add_(fc2_contribs[i].to(master_grad.dtype))
             
     def synchronize_replica_weights_with_master(self):
         """Synchronize replica weights from their source originals.

@@ -624,13 +624,25 @@ class _ParamAndGradBuffer:
         # First, figure out how many elements should be in the underlying buffer storage.
         # Note that if we need to split the buffer into smaller buckets, each of these
         # might need to be padded as well (if using the distributed optimizer).
+        #
+        # EPLB replica parameters are excluded from this buffer - they use a shared
+        # gradient buffer managed by EPLBSharedGradBufferManager to save memory.
         param_start_index = 0
         bucket_start_index = param_start_index
         bucket_params = set()
         self.bucket_indices = []
         per_bucket_numel_unpadded = []
         bucket_id = 0
+        
+        # Track EPLB replica parameters that use shared gradient buffer.
+        # These are excluded from this buffer's main_grad allocation - the shared
+        # EPLBSharedGradBufferManager will assign their main_grad instead.
+        self.eplb_replica_params = set()
+        for param in params:
+            if getattr(param, 'is_eplb_replica', False):
+                self.eplb_replica_params.add(param)
 
+        bucket_end_index = 0
         def _update_bucket_metadata(param_end_index: int) -> int:
             """
             Record metadata for the bucket starting at bucket_start_index and ending with the
@@ -666,6 +678,13 @@ class _ParamAndGradBuffer:
 
         for param in params[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order.
+            
+            # Skip EPLB replica parameters - they use shared gradient buffer
+            # and don't participate in normal DDP gradient reduction
+            if param in self.eplb_replica_params:
+                # Store a sentinel value to indicate this param is excluded from buffer
+                self.param_index_map[param] = (-1, -1, -1)
+                continue
 
             this_numel = param.data.nelement()
             param_start_index = _pad_start_of_param_if_needed(param_start_index)
@@ -758,10 +777,16 @@ class _ParamAndGradBuffer:
                 )
 
         # Finally, map param.data and param.main_grad fields to buffers.
+        # EPLB replica parameters are skipped - their main_grad will be assigned
+        # by EPLBSharedGradBufferManager to share gradient buffers across layers.
         bucket_params = []
         bucket_start_index = 0
         cur_bucket_id = 0
         for param in params[::-1]:
+            # Skip EPLB replica parameters - they use shared gradient buffer
+            if param in self.eplb_replica_params:
+                continue
+            
             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
             # For MXFP8 param: we only need to map weight gradients to the buffer.
             if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
@@ -829,6 +854,17 @@ class _ParamAndGradBuffer:
             )
             for param in bucket.params:
                 log_strs.append(f"\t{param_to_name[param]}")
+        
+        # Log EPLB replica params that are excluded from this buffer
+        if len(self.eplb_replica_params) > 0:
+            eplb_numel = sum(p.data.nelement() for p in self.eplb_replica_params)
+            log_strs.append(
+                f"EPLB replica params excluded from buffer: {len(self.eplb_replica_params)} params "
+                f"({eplb_numel:,} elements, using shared gradient buffer)"
+            )
+            for param in self.eplb_replica_params:
+                log_strs.append(f"\t{param_to_name[param]} (EPLB replica)")
+        
         log_on_each_pipeline_stage(
             logger,
             logging.INFO,

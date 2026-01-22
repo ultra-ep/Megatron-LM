@@ -1233,6 +1233,11 @@ def setup_model_and_optimizer(
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
 
+    if args.moe_enable_eplb:
+        # Initialize shared gradient buffers for replica experts
+        from megatron.core.transformer.moe.eplb import initialize_eplb_shared_grad_buffers
+        initialize_eplb_shared_grad_buffers(model)
+
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     config, config_overrides = get_megatron_optimizer_config(args)
     config.timers = timers

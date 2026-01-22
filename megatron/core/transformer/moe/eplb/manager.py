@@ -15,7 +15,7 @@ Key components:
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -417,3 +417,38 @@ class EPLBManager:
         mask = torch.zeros(self.num_local_physical_experts, dtype=torch.bool, device=device)
         mask[:self.num_local_master_experts] = True
         return mask
+
+
+def initialize_eplb_shared_grad_buffers(model: Union[torch.nn.Module, List[torch.nn.Module]]):
+    """
+    Initialize shared gradient buffers for all EPLB-enabled MoE layers in the model.
+    
+    This function traverses the model and calls initialize_eplb_shared_grad_buffer()
+    on each MoE layer that has EPLB enabled. It should be called after model construction
+    is complete and after the DDP wrapper has allocated main_grad buffers.
+    
+    Usage:
+        model = build_model(...)  # Build model
+        model = DDP(model, ...)   # Wrap with DDP
+        initialize_eplb_shared_grad_buffers(model)  # Initialize shared buffers
+    
+    Args:
+        model: The model (or DDP-wrapped model, or list of model chunks) containing MoE layers
+    """
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+        
+    # Handle list of models (e.g., interleaved pipeline parallelism)
+    if isinstance(model, list):
+        for model_chunk in model:
+            initialize_eplb_shared_grad_buffers(model_chunk)
+        return
+    
+    # Handle DDP-wrapped models
+    if hasattr(model, 'module'):
+        model = model.module
+    
+    # Traverse all modules and find MoE layers
+    for name, module in model.named_modules():
+        if isinstance(module, MoELayer) and module.eplb_enabled:
+            layer_name = f"layer_{module.layer_number}" if module.layer_number else ""
+            module.experts.initialize_shared_grad_buffer(layer_name=layer_name)
