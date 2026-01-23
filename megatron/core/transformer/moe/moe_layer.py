@@ -424,19 +424,19 @@ class MoELayer(BaseMoELayer):
                 # like cuda_graph_scope=["moe_router", "moe_preprocess"].
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
-            
-            # EPLB: Wrap input with autograd function to trigger replica gradient reduction
-            # during backward pass. By wrapping the INPUT, the wrapper's backward fires AFTER
-            # the MoE layer's backward is complete (when gradients are in main_grad).
-            # This ensures replica gradients are reduced after each microbatch's backward
-            # (not just the last one like DDP overlap_grad_reduce).
-            if self.eplb_enabled:
-                hidden_states = _EPLBReplicaGradReduceStartFunction.apply(hidden_states, self)
 
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
             return output, mlp_bias
+        
+        # EPLB: Wrap input with autograd function to trigger replica gradient reduction
+        # during backward pass. By wrapping the INPUT, the wrapper's backward fires AFTER
+        # the MoE layer's backward is complete (when gradients are in main_grad).
+        # This ensures replica gradients are reduced after each microbatch's backward
+        # (not just the last one like DDP overlap_grad_reduce).
+        if self.eplb_enabled:
+            hidden_states = _EPLBReplicaGradReduceStartFunction.apply(hidden_states, self)
 
         if self.moe_layer_recompute:
             if self.config.fp8 or self.config.fp4:

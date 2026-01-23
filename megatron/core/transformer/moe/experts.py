@@ -5,7 +5,7 @@ import itertools
 from copy import deepcopy
 from functools import partial
 from math import ceil
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -55,6 +55,11 @@ from megatron.core.transformer.moe.eplb.manager import EPLBManager
 from megatron.core.transformer.moe.eplb.shared_grad_buffer import (
     get_or_create_shared_grad_buffer_manager,
     EPLBSharedGradBufferManager,
+)
+from megatron.core.transformer.moe.eplb.types import P2PReplicaGradCommMap
+from megatron.core.transformer.moe.eplb.fused_kernels import (
+    compute_p2p_maps_for_replica_grad_comm,
+    sum_and_add_replica_grads_to_master,
 )
 
 try:
@@ -858,6 +863,10 @@ class TEGroupedMLP(MegatronModule):
             # This is shared across all MoE layers to save memory
             self._shared_grad_buffer_manager: Optional[EPLBSharedGradBufferManager] = None
             self._shared_grad_buffer_initialized = False
+            
+            # P2P-based gradient reduction state
+            self._eplb_p2p_reqs = None  # Async P2P request handles
+            self._p2p_replica_grad_comm_map = None  # P2P communication mapping
 
     def _mark_replica_parameters(self):
         """Mark replica expert parameters with is_eplb_replica=True attribute.
@@ -928,11 +937,13 @@ class TEGroupedMLP(MegatronModule):
         
         self._shared_grad_buffer_initialized = True
                 
-    def _init_eplb_index_mappings(self):
+    def _init_allreduce_replica_grad_comm_map(self):
         """Pre-compute index mappings as GPU tensors to avoid ALL D2H transfers.
         
         This stores slices of the physical_to_logical_map as GPU tensors, which can
         be used for advanced indexing (index_copy_, index_select) during backward.
+
+        The placement may be updated from run to run, so always recompute the mappings.
         """
         if not self.eplb_manager._placement_initialized:
             return
@@ -954,7 +965,7 @@ class TEGroupedMLP(MegatronModule):
         master_start = ep_rank * num_local_physical
         master_end = master_start + num_local_master
         self._eplb_master_logical_indices = physical_to_logical[master_start:master_end].long()
-        
+
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
@@ -1185,8 +1196,32 @@ class TEGroupedMLP(MegatronModule):
         """
         assert hasattr(param, 'main_grad') and param.main_grad is not None, "main_grad is not available"
         param.main_grad.zero_()
-
+    
     def start_replica_grad_reduce(self, async_op: bool = True):
+        """Start async replica gradient reduction.
+        
+        This method starts the async replica gradient reduction by calling either
+        _start_replica_grad_all_reduce() or _start_replica_grad_p2p_reduce()
+        depending on the configuration.
+        """
+        if self.config.moe_eplb_replica_grad_reduce_type == "allreduce":
+            return self._start_replica_grad_all_reduce(async_op)
+        elif self.config.moe_eplb_replica_grad_reduce_type == "p2p":
+            return self._start_replica_grad_p2p_reduce(async_op)
+        else:
+            raise ValueError(f"Invalid replica grad reduction type: {self.config.eplb_replica_grad_reduce_type}")
+    
+    def finish_replica_grad_reduce(self):
+        """Finish async replica gradient reduction.
+        """
+        if self.config.moe_eplb_replica_grad_reduce_type == "allreduce":
+            return self._finish_replica_grad_all_reduce()
+        elif self.config.moe_eplb_replica_grad_reduce_type == "p2p":
+            return self._finish_replica_grad_p2p_reduce()
+        else:
+            raise ValueError(f"Invalid replica grad reduction type: {self.config.eplb_replica_grad_reduce_type}")
+
+    def _start_replica_grad_all_reduce(self, async_op: bool = True):
         """Start async all-reduce of replica gradients to master experts.
         
         This should be called after all replica expert gradients are computed in the 
@@ -1213,7 +1248,7 @@ class TEGroupedMLP(MegatronModule):
             return None
         
         # Initialize index mappings on first call
-        self._init_eplb_index_mappings()
+        self._init_allreduce_replica_grad_comm_map()
         
         ep_group = self.eplb_manager.ep_group
         num_redundant = self.eplb_manager.num_redundant_per_rank
@@ -1262,7 +1297,7 @@ class TEGroupedMLP(MegatronModule):
             return handle
         return None
     
-    def finish_replica_grad_reduce(self):
+    def _finish_replica_grad_all_reduce(self):
         """Finish async replica gradient reduction and add to master gradients.
         
         This waits for the async all-reduce to complete and adds the aggregated
@@ -1308,6 +1343,206 @@ class TEGroupedMLP(MegatronModule):
             master_grad = self._get_param_grad(master_weight)
             if master_grad is not None:
                 master_grad.add_(fc2_contribs[i].to(master_grad.dtype))
+
+    def _start_replica_grad_p2p_reduce(self, async_op: bool = True):
+        """Start async P2P send/recv of replica gradients to master experts.
+        
+        This is a more communication-efficient alternative to start_replica_grad_reduce()
+        which uses all-reduce. Instead of all-reduce over a global buffer, this method
+        uses point-to-point communication where each replica sends its gradient directly
+        to the rank holding the master expert.
+        
+        Communication volume comparison:
+        - All-reduce: O(num_global_logical_experts * expert_size)
+        - P2P: O(num_total_replicas * expert_size)
+        
+        Since num_total_replicas << num_global_logical_experts in typical setups,
+        P2P is significantly more efficient.
+        
+        Correctness guarantee:
+        - Uses logical_expert_idx as P2P tag to ensure correct send/recv matching
+        - Without tags, when multiple tensors are sent between the same rank pair,
+          the matching would be undefined (e.g., Rank 0 sends [expert2, expert3] to 
+          Rank 1, but Rank 1 might recv in order [expert3, expert2])
+        - Tags ensure send(expert_i_grad, tag=i) matches recv(tag=i)
+        
+        Performance optimizations:
+        - Uses batch_isend_irecv for efficient batched P2P operations
+        - Pre-computed communication maps avoid D2H transfers
+        - Contiguous send buffers from shared gradient buffer
+        
+        Args:
+            async_op: If True, return immediately with async handles. If False, block.
+            
+        Returns:
+            List of request handles if async_op=True, else None
+        """
+        if not self.eplb_enabled or self.eplb_manager is None:
+            return None
+        
+        if not self.eplb_manager._placement_initialized:
+            return None
+        
+        # Initialize communication maps
+        self._p2p_replica_grad_comm_map = compute_p2p_maps_for_replica_grad_comm(
+            self.eplb_manager.ep_rank,
+            self.eplb_manager.num_local_master_experts,
+            self.eplb_manager.num_redundant_per_rank,
+            self.eplb_manager.num_local_physical_experts,
+            self.eplb_manager.placement.physical_to_logical_map,
+            self.eplb_manager.placement.logical_to_physical_map,
+            self.eplb_manager.placement.logical_replica_counts
+        )
+        
+        ep_group = self.eplb_manager.ep_group
+        ep_size = self.eplb_manager.ep_size
+        num_local_master = self.eplb_manager.num_local_master_experts
+        num_redundant = self.eplb_manager.num_redundant_per_rank
+        
+        if num_redundant == 0:
+            return None
+        
+        # Ensure shared buffer manager is available
+        if self._shared_grad_buffer_manager is None:
+            raise RuntimeError(
+                "Shared grad buffer manager not initialized. "
+                "Call initialize_shared_grad_buffer() first."
+            )
+        
+        # Get or create recv buffers for local masters
+        # max_redundant_senders = ep_size - 1 since replicas are always from other ranks
+        max_redundant_senders = ep_size - 1
+        recv_buffers = self._shared_grad_buffer_manager.get_or_create_local_master_grad_recv_buffers(
+            num_local_master=num_local_master,
+            max_redundant_senders=max_redundant_senders
+        )
+        
+        # Prepare send buffers: fused fc1 + fc2 grads for each local replica
+        fc1_replica_grads = self._shared_grad_buffer_manager.get_fc1_stacked_grads()
+        fc2_replica_grads = self._shared_grad_buffer_manager.get_fc2_stacked_grads()
+        
+        # Flatten and concatenate: [num_redundant, total_numel_per_expert]
+        fc1_flat = fc1_replica_grads.view(num_redundant, -1)
+        fc2_flat = fc2_replica_grads.view(num_redundant, -1)
+        fused_replica_grads = torch.cat([fc1_flat, fc2_flat], dim=1)
+        
+        # Build batch_isend_irecv operations
+        # IMPORTANT: We use logical_expert_idx as tag to ensure correct send/recv matching.
+        p2p_ops = []
+        
+        # ===== Single batched D2H for P2POp construction (unavoidable due to PyTorch API) =====
+        # Send info: [num_redundant, 2] -> (master_rank, logical_idx)
+        comm_map = self._p2p_replica_grad_comm_map
+        if comm_map.replica_master_ranks is not None and num_redundant > 0:
+            send_info = torch.stack([
+                comm_map.replica_master_ranks, 
+                comm_map.replica_logical_indices
+            ], dim=1).tolist()  # Single D2H
+            
+            for replica_idx, (master_rank, logical_expert_idx) in enumerate(send_info):
+                p2p_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        fused_replica_grads[replica_idx],
+                        int(master_rank),
+                        group=ep_group,
+                        tag=int(logical_expert_idx)
+                    )
+                )
+        
+        # Recv info: need sender_ranks, logical_indices, valid_mask
+        if comm_map.master_sender_ranks is not None and num_local_master > 0:
+            sender_ranks_cpu = comm_map.master_sender_ranks.tolist()
+            logical_indices_cpu = comm_map.master_logical_indices.tolist()
+            valid_mask_cpu = comm_map.master_valid_mask.tolist()
+            
+            for master_idx in range(num_local_master):
+                logical_expert_idx = int(logical_indices_cpu[master_idx])
+                recv_slot_idx = 0
+                for j, is_valid in enumerate(valid_mask_cpu[master_idx]):
+                    if is_valid:
+                        sender_rank = int(sender_ranks_cpu[master_idx][j])
+                        p2p_ops.append(
+                            torch.distributed.P2POp(
+                                torch.distributed.irecv,
+                                recv_buffers[master_idx, recv_slot_idx],  # Use 3D indexing
+                                sender_rank,
+                                group=ep_group,
+                                tag=logical_expert_idx
+                            )
+                        )
+                        recv_slot_idx += 1
+        
+        # Execute batched P2P operations
+        if p2p_ops:
+            reqs = torch.distributed.batch_isend_irecv(p2p_ops)
+        else:
+            reqs = []
+        
+        if async_op:
+            self._eplb_p2p_reqs = reqs
+            return reqs
+        else:
+            for req in reqs:
+                req.wait()
+            return None
+    
+    def _finish_replica_grad_p2p_reduce(self):
+        """Finish async P2P replica gradient reduction and add to master gradients.
+        
+        Performance optimizations:
+        - Uses fused kernel (torch.compile) for masked sum and addition.
+        - Receive buffer is already contiguous 3D tensor (no stack needed).
+        """
+        if not self.eplb_enabled or self.eplb_manager is None:
+            return
+        
+        # Wait for all P2P operations to complete
+        if hasattr(self, '_eplb_p2p_reqs') and self._eplb_p2p_reqs:
+            for req in self._eplb_p2p_reqs:
+                req.wait()
+            self._eplb_p2p_reqs = None
+        
+        # Early exit if no comm map
+        if self._p2p_replica_grad_comm_map is None:
+            return
+        
+        num_local_master = self.eplb_manager.num_local_master_experts
+        if num_local_master == 0:
+            return
+        
+        # Check if any master has replicas (GPU operation, no D2H)
+        comm_map = self._p2p_replica_grad_comm_map
+        if comm_map.master_recv_counts.sum() == 0:
+            return
+        
+        fc1_shape = self._shared_grad_buffer_manager.fc1_weight_shape
+        fc2_shape = self._shared_grad_buffer_manager.fc2_weight_shape
+        fc1_numel = self._shared_grad_buffer_manager.fc1_numel_per_expert
+        
+        recv_buffers = self._shared_grad_buffer_manager.get_or_create_local_master_grad_recv_buffers()
+        
+        # Collect master gradients into lists for the compiled function
+        master_grads_fc1 = []
+        master_grads_fc2 = []
+        for i in range(num_local_master):
+            # fc1
+            weight1 = getattr(self.linear_fc1, f'weight{i}')
+            master_grads_fc1.append(self._get_param_grad(weight1))
+            # fc2
+            weight2 = getattr(self.linear_fc2, f'weight{i}')
+            master_grads_fc2.append(self._get_param_grad(weight2))
+            
+        # Call fused kernel
+        sum_and_add_replica_grads_to_master(
+            recv_buffers,
+            comm_map.master_recv_counts,
+            master_grads_fc1,
+            master_grads_fc2,
+            fc1_numel,
+            fc1_shape,
+            fc2_shape
+        )
             
     def synchronize_replica_weights_with_master(self):
         """Synchronize replica weights from their source originals.

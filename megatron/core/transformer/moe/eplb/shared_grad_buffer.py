@@ -95,8 +95,13 @@ class EPLBSharedGradBufferManager:
         # Initialize flag
         self._initialized = False
 
-        # (Optional) Global logical experts buffer
+        # (Optional) Global logical experts buffer for all reduce
+        # Shape: [num_global_logical, total_numel_per_expert]
         self._global_logical_experts_grad_buffer: Optional[torch.Tensor] = None
+
+        # (Optional) Local master grad recv buffer for p2p + local reduce
+        # Shape: [num_local_master, max_redundant, total_numel_per_expert]
+        self._local_master_grad_recv_buffers: Optional[torch.Tensor] = None
     
     def _allocate_buffer(self):
         """Allocate the shared gradient buffer."""
@@ -146,6 +151,45 @@ class EPLBSharedGradBufferManager:
             device=self.device,
         )
         return self._global_logical_experts_grad_buffer
+    
+    def get_or_create_local_master_grad_recv_buffers(
+            self, 
+            num_local_master: Optional[int] = None,
+            max_redundant_senders: Optional[int] = None
+        ):
+        """Allocate the shared gradient buffer for local master grad recv buffers.
+        
+        These buffers are used for P2P-based replica gradient reduction, where each
+        local master expert receives gradients from its replicas on other ranks.
+        
+        Buffer organization:
+        - A single contiguous 3D tensor: [num_local_master, max_redundant_senders, total_numel_per_expert]
+        - This layout avoids expensive torch.stack operations during reduction.
+        
+        Args:
+            num_local_master: Number of local master experts on this rank
+            max_redundant_senders: Maximum number of ranks that can send to each master
+        
+        Returns:
+            Recv buffer tensor of shape [num_local_master, max_redundant_senders, total_numel_per_expert]
+        """
+        if self._local_master_grad_recv_buffers is not None:
+            return self._local_master_grad_recv_buffers
+        
+        assert num_local_master is not None, "num_local_master must be provided"
+        assert max_redundant_senders is not None, "max_redundant_senders must be provided"
+        
+        self._local_master_grad_recv_buffers = torch.zeros(
+            (num_local_master, max_redundant_senders, self.total_numel_per_expert),
+            dtype=self.grad_dtype,
+            device=self.device,
+        )
+        return self._local_master_grad_recv_buffers
+    
+    def zero_local_master_recv_buffers(self):
+        """Zero out the local master grad recv buffer."""
+        if self._local_master_grad_recv_buffers is not None:
+            self._local_master_grad_recv_buffers.zero_()
     
     def get_fc1_grad_view(self, replica_idx: int) -> torch.Tensor:
         """
