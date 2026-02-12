@@ -539,36 +539,8 @@ class TopKRouter(Router):
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map)
-        
-        # # Hook for EPLB: collect token statistics for future online EPLB
-        # self._collect_eplb_stats(routing_map)
 
         return probs, routing_map
-
-    def _collect_eplb_stats(self, routing_map: torch.Tensor):
-        """Collect token statistics for EPLB.
-        
-        This hook collects token distribution statistics that can be used
-        by online EPLB algorithms to adjust expert placement and dispatch.
-        
-        Args:
-            routing_map: Token to expert mapping tensor
-        """
-        if hasattr(self, '_eplb_stats_callback') and self._eplb_stats_callback is not None:
-            with torch.no_grad():
-                tokens_per_expert = routing_map.sum(dim=0)
-                self._eplb_stats_callback(tokens_per_expert)
-
-    def set_eplb_stats_callback(self, callback):
-        """Set callback for EPLB statistics collection.
-        
-        This method allows external code (e.g., EPLBManager) to register a callback
-        that will be called with token statistics after each routing pass.
-        
-        Args:
-            callback: Callable that takes tokens_per_expert tensor as input
-        """
-        self._eplb_stats_callback = callback
 
     def reset_global_aux_loss_tracker(self):
         """Reset the global aux loss tracker."""

@@ -98,7 +98,6 @@ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
-from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -1233,11 +1232,6 @@ def setup_model_and_optimizer(
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
 
-    if args.moe_enable_eplb:
-        # Initialize shared gradient buffers for replica experts
-        from megatron.core.transformer.moe.eplb import initialize_eplb_shared_grad_buffers
-        initialize_eplb_shared_grad_buffers(model)
-
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     config, config_overrides = get_megatron_optimizer_config(args)
     config.timers = timers
@@ -1386,23 +1380,6 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
-def synchronize_moe_eplb_replica_weights(model):
-    """Synchronize EPLB replica expert weights with their source masters.
-    
-    After optimizer.step() updates master expert weights, this function propagates
-    those updates to replica experts across all MoE layers in the model.
-    
-    Args:
-        model: List of model chunks (possibly wrapped in DDP/Float16Module/FSDP)
-    """
-    for model_chunk in model:
-        # unwrap_model with None uses default wrappers (DDP, FSDP, Float16Module)
-        unwrapped = unwrap_model(model_chunk)
-        for module in unwrapped.modules():
-            if isinstance(module, MoELayer) and module.eplb_enabled:
-                module.experts.synchronize_replica_weights_with_master()
-
-
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
     """Single training step."""
     args = get_args()
@@ -1485,10 +1462,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.update_momentum(args.curr_iteration)
-
-    # Synchronize EPLB replica expert weights after successful optimizer step.
-    if update_successful and getattr(config, 'moe_enable_eplb', False):
-        synchronize_moe_eplb_replica_weights(model)
 
     # Update learning rate.
     if update_successful:

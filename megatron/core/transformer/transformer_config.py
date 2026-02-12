@@ -717,12 +717,6 @@ class TransformerConfig(ModelParallelConfig):
     - 'random': Random dispatch to original or replica with equal probability
     - 'online': Future - adaptive dispatch based on real-time statistics"""
 
-    moe_eplb_replica_grad_reduce_type: str = "p2p"
-    """Communication type for replica gradient reduction.
-    Options:
-    - 'p2p': P2P-based gradient reduction (much more efficient)
-    - 'allreduce': All-reduce-based gradient reduction"""
-
     ##################
     # Context Parallel
     ##################

@@ -25,7 +25,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.moe.experts import TEGroupedMLP
-from megatron.core.transformer.moe.eplb.manager import EPLBManager, HAVE_EPLB
+from megatron.core.transformer.moe.eplb_manager import HAVE_EPLB, get_or_create_eplb_manager
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -67,8 +67,7 @@ class _EPLBReplicaGradReduceStartFunction(torch.autograd.Function):
         This fires AFTER the MoE layer's backward is complete because we wrap the input.
         At this point, replica gradients are already computed and in main_grad.
         """
-        ctx.moe_layer.experts.start_replica_grad_reduce(async_op=True)
-        
+        ctx.moe_layer._eplb_start_grad_reduce()
         return grad_output, None
 
 
@@ -99,8 +98,7 @@ class _EPLBReplicaGradReduceFinishFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward pass: finish EPLB replica gradient reduction.
         """        
-        ctx.moe_layer.experts.finish_replica_grad_reduce()
-
+        ctx.moe_layer._eplb_finish_grad_reduce()
         return grad_output, None
 
 
@@ -206,17 +204,19 @@ class MoELayer(BaseMoELayer):
                     "EPLB is enabled but eplb module could not be imported. "
                     "Please ensure megatron.core.transformer.moe.eplb is available."
                 )
-            self.eplb_manager = EPLBManager(
+            self.eplb_manager = get_or_create_eplb_manager(
                 config=config,
-                num_local_master_experts=self.num_local_master_experts,
-                local_master_expert_indices=self.local_master_expert_indices,
                 ep_group=self.ep_group,
             )
-            self.eplb_manager.initialize_placement()
+            self.eplb_manager.initialize_placement_random()
             # Number of experts to compute = local masters + local replicas
             self.num_local_physical_experts = self.eplb_manager.num_local_physical_experts
             self.num_global_physical_experts = self.eplb_manager.num_global_physical_experts
             self.local_physical_expert_indices = self.eplb_manager.local_physical_expert_indices
+            # Event handles
+            self._eplb_grad_reduce_event_handle = None
+            self._eplb_weight_sync_event_handle = None
+
         else:
             self.num_local_physical_experts = self.num_local_master_experts
             self.num_global_physical_experts = self.config.num_moe_experts
@@ -268,16 +268,14 @@ class MoELayer(BaseMoELayer):
             self.num_local_physical_experts,  # Includes replicas when EPLB is enabled
             self.config,
             pg_collection=pg_collection,
-            eplb_manager=self.eplb_manager,  # Pass EPLB manager for gradient handling
         )
-        # Initialize replica expert weight based on current placement
+        self._eplb_master_ptrs_registered = not self.eplb_enabled
         if self.eplb_enabled:
             assert isinstance(self.experts, TEGroupedMLP), \
                 f"experts must be a TEGroupedMLP when EPLB is enabled, but got {type(self.experts)}"
-            self.experts.synchronize_replica_weights_with_master()
-            # Note: EPLB backward hooks will be registered lazily in forward() after
-            # the first forward pass, because hook registration requires grad_fn which
-            # is only available after a forward pass creates the autograd graph.
+            # Phase 1: mark replicas and set their data/grad to shared UltraEP buffers.
+            self._eplb_register_redundant_experts()
+            # Phase 2 (_eplb_register_master_experts) must be called after DDP init.
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -292,6 +290,139 @@ class MoELayer(BaseMoELayer):
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
+
+    def _eplb_register_redundant_experts(self):
+        """Phase 1: Register replica expert weights and grads with shared UltraEP buffers.
+
+        Called during model initialization, BEFORE DDP / _ParamAndGradBuffer init.
+
+        This method:
+            - Marks replica weight parameters with ``is_eplb_replica = True`` so that
+              _ParamAndGradBuffer skips allocating weight and gradient buffer space
+              for them (they use cross-layer shared buffers from UltraEP instead).
+            - Re-points each replica weight's ``.data`` and ``.main_grad`` to the
+              corresponding views in UltraEP's shared buffers.  Because
+              _ParamAndGradBuffer skips ``is_eplb_replica`` params, these assignments
+              are never overwritten.
+
+        Master expert pointer registration (``construct_local_master_ptr_pool``)
+        is deferred to :meth:`_eplb_register_master_experts`, which MUST be called
+        after DDP initialization completes (when ``main_grad`` has been assigned to
+        master weights by ``_ParamAndGradBuffer``).
+        """
+        num_local_master = self.eplb_manager.num_local_master_experts
+        num_local_redundant = self.eplb_manager.num_local_redundant_experts
+        num_local_physical = num_local_master + num_local_redundant
+        expert_fc1_numel = self.eplb_manager.expert_fc1_numel
+        expert_fc2_numel = self.eplb_manager.expert_fc2_numel
+        expert_total_numel = self.eplb_manager.expert_total_numel
+        local_replica_weight_buffer = self.eplb_manager.local_replica_weight_buffer
+        local_replica_grad_buffer = self.eplb_manager.local_replica_grad_buffer
+
+        for module_idx, linear_module in enumerate([self.experts.linear_fc1, self.experts.linear_fc2]):
+            expert_weight0 = getattr(linear_module, 'weight0', None)
+            if module_idx == 0:
+                assert expert_fc1_numel == expert_weight0.numel()
+                module_shape = expert_weight0.shape
+                expert_data_range = slice(0, expert_fc1_numel)
+            else:
+                assert expert_fc2_numel == expert_weight0.numel()
+                module_shape = expert_weight0.shape
+                expert_data_range = slice(expert_fc1_numel, expert_total_numel)
+
+            # Only process replica experts (indices >= num_local_master)
+            for expert_idx in range(num_local_master, num_local_physical):
+                local_replica_offset = expert_idx - num_local_master
+                replica_weight = getattr(linear_module, f'weight{expert_idx}', None)
+                assert replica_weight is not None, (
+                    f"weight{expert_idx} is not found in {linear_module}"
+                )
+
+                # Mark as EPLB replica so that:
+                #   - _ParamAndGradBuffer skips weight & grad buffer allocation
+                #   - Distributed optimizer skips optimizer state allocation
+                setattr(replica_weight, 'is_eplb_replica', True)
+
+                # Re-point .data and .main_grad to views in UltraEP's cross-layer
+                # shared buffers.  _ParamAndGradBuffer will skip is_eplb_replica
+                # params, so these assignments are preserved.
+                replica_weight.data = (
+                    local_replica_weight_buffer[local_replica_offset, expert_data_range]
+                    .view(module_shape)
+                )
+                replica_weight.main_grad = (
+                    local_replica_grad_buffer[local_replica_offset, expert_data_range]
+                    .view(module_shape)
+                )
+
+        self._eplb_master_ptrs_registered = False
+
+    def _eplb_register_master_experts(self):
+        """Phase 2: Register master expert weight/grad pointers with UltraEP runtime.
+
+        MUST be called AFTER DDP initialization (``_ParamAndGradBuffer`` has mapped
+        master expert weights to contiguous ``param_data`` and assigned ``main_grad``
+        from ``grad_data``).
+
+        This method collects the **final** ``.data`` and ``.main_grad`` tensor
+        pointers for master experts and passes them to UltraEP's
+        ``construct_local_master_ptr_pool`` so that ``weight_sync`` and
+        ``grad_reduce`` operations can locate the correct device memory.
+        """
+        if self._eplb_master_ptrs_registered:
+            return
+
+        num_local_master = self.eplb_manager.num_local_master_experts
+
+        master_fc1_weights = []
+        master_fc2_weights = []
+        master_fc1_grads = []
+        master_fc2_grads = []
+
+        for module_idx, linear_module in enumerate([self.experts.linear_fc1, self.experts.linear_fc2]):
+            for expert_idx in range(num_local_master):
+                master_weight = getattr(linear_module, f'weight{expert_idx}', None)
+                assert master_weight is not None, (
+                    f"weight{expert_idx} is not found in {linear_module}"
+                )
+                assert hasattr(master_weight, 'main_grad'), (
+                    f"weight{expert_idx}.main_grad not found in {linear_module}. "
+                    f"_eplb_register_master_experts() must be called after DDP initialization."
+                )
+
+                if module_idx == 0:
+                    master_fc1_weights.append(master_weight.data)
+                    master_fc1_grads.append(master_weight.main_grad)
+                else:
+                    master_fc2_weights.append(master_weight.data)
+                    master_fc2_grads.append(master_weight.main_grad)
+
+        self.eplb_manager.runtime.construct_local_master_ptr_pool(
+            layer_id=self.layer_number,
+            fc1_weights=master_fc1_weights,
+            fc2_weights=master_fc2_weights,
+            fc1_grads=master_fc1_grads,
+            fc2_grads=master_fc2_grads,
+        )
+        self._eplb_master_ptrs_registered = True
+    
+    def _eplb_start_grad_reduce(
+        self,
+        mode: str = "low_sm",
+        async_finish: bool = True,
+    ):
+        self._eplb_grad_reduce_event_handle = (
+            self.eplb_manager.runtime.grad_reduce(
+                layer_id=self.layer_number,
+                mode=mode,
+                async_finish=async_finish,
+            )
+        )
+
+    def _eplb_finish_grad_reduce(self):
+        if self._eplb_grad_reduce_event_handle is not None:
+            self._eplb_grad_reduce_event_handle.current_stream_wait()
+            self._eplb_grad_reduce_event_handle = None
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor):
@@ -407,14 +538,24 @@ class MoELayer(BaseMoELayer):
                 "are enabled without also enabling sequence parallelism."
             )
 
+        # Lazily finalize EPLB master pointer registration after DDP init.
+        # This is a safety net; callers should ideally invoke
+        # _eplb_register_master_experts() explicitly after DDP construction.
+        if self.eplb_enabled and not self._eplb_master_ptrs_registered:
+            self._eplb_register_master_experts()
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map = self.route(hidden_states)
+
                 # EPLB: expand routing map to include replica assignments
                 if self.eplb_enabled and self.eplb_manager is not None:
-                    routing_map, probs = self.eplb_manager.expand_routing_map(routing_map, probs)
+                    routing_map, probs = self.eplb_manager.reroute_random(routing_map, probs)
+                    self._eplb_weight_sync_event_handle = (
+                        self.eplb_manager.runtime.weight_sync(layer_id=self.layer_number, async_finish=True)
+                    )
 
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
@@ -425,18 +566,21 @@ class MoELayer(BaseMoELayer):
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
+            # EPLB: Wrap input with autograd function to trigger replica gradient reduction
+            # during backward pass. By wrapping the INPUT, the wrapper's backward fires AFTER
+            # the MoE layer's backward is complete (when gradients are in main_grad).
+            # This ensures replica gradients are reduced after each microbatch's backward
+            # (not just the last one like DDP overlap_grad_reduce).
+            if self.eplb_enabled:
+                hidden_states = _EPLBReplicaGradReduceStartFunction.apply(hidden_states, self)
+                if self._eplb_weight_sync_event_handle is not None:
+                    self._eplb_weight_sync_event_handle.current_stream_wait()
+                    self._eplb_weight_sync_event_handle = None
+
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
             return output, mlp_bias
-        
-        # EPLB: Wrap input with autograd function to trigger replica gradient reduction
-        # during backward pass. By wrapping the INPUT, the wrapper's backward fires AFTER
-        # the MoE layer's backward is complete (when gradients are in main_grad).
-        # This ensures replica gradients are reduced after each microbatch's backward
-        # (not just the last one like DDP overlap_grad_reduce).
-        if self.eplb_enabled:
-            hidden_states = _EPLBReplicaGradReduceStartFunction.apply(hidden_states, self)
 
         if self.moe_layer_recompute:
             if self.config.fp8 or self.config.fp4:
@@ -455,17 +599,7 @@ class MoELayer(BaseMoELayer):
         return outputs
 
     def backward_dw(self):
-        """Compute weight gradients for experts and shared experts.
-        
-        When delay_wgrad_compute is disabled (DEFAULT):
-        - This method is never called
-        - Weight gradients are computed during normal autograd backward
-        - EPLB replica gradient aggregation should use async hooks instead
-          (call finish_eplb_replica_grad_reduce after backward)
-        
-        When delay_wgrad_compute is enabled (Incompatible with EPLB):
-        - This method computes deferred weight gradients
-        """
+        """Compute weight gradients for experts and shared experts."""
         self.experts.backward_dw()
         if self.use_shared_expert and not self.shared_expert_overlap:
             self.shared_experts.backward_dw()

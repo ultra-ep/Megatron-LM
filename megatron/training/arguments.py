@@ -3328,9 +3328,6 @@ def _add_moe_args(parser):
     group.add_argument('--moe-eplb-dispatch-strategy', type=str, default='random', choices=['random', 'online'],
                        help='Strategy for redundant expert dispatcher. '
                        'Options are "random" and "online". The default is "random".')
-    group.add_argument('--moe-eplb-replica-grad-reduce-type', type=str, default='p2p', choices=['p2p', 'allreduce'],
-                       help='Communication type for replica gradient reduction. '
-                       'Options are "p2p" (much more efficient) and "allreduce". The default is "p2p".')
     return parser
 
 def _add_mla_args(parser):
