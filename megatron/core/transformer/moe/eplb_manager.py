@@ -45,6 +45,7 @@ class EPLBManager:
 
         self.runtime = ultra_ep.Manager(
             group=self.group,
+            num_layers=config.num_layers,
             num_local_master_experts=self.num_local_master_experts,
             num_local_redundant_experts=self.num_local_redundant_experts,
             expert_fc1_numel=self.expert_fc1_numel,
@@ -86,6 +87,7 @@ class EPLBManager:
     
     def reroute_random(
         self,
+        layer_id: int,
         routing_map: torch.Tensor,
         probs: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -108,8 +110,8 @@ class EPLBManager:
         )
 
         ## Random dispatch
-        logical_to_physical = self.logical_to_physical_map_gpu
-        replica_counts = self.logical_replica_counts_gpu
+        logical_to_physical = self.logical_to_physical_map_gpu[layer_id]
+        replica_counts = self.logical_replica_counts_gpu[layer_id]
         
         # Find all (token, logical_expert) pairs that are routed
         token_indices, logical_indices = routing_map.nonzero(as_tuple=True)

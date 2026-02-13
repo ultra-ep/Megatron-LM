@@ -552,7 +552,7 @@ class MoELayer(BaseMoELayer):
 
                 # EPLB: expand routing map to include replica assignments
                 if self.eplb_enabled and self.eplb_manager is not None:
-                    routing_map, probs = self.eplb_manager.reroute_random(routing_map, probs)
+                    routing_map, probs = self.eplb_manager.reroute_random(self.layer_number, routing_map, probs)
                     self._eplb_weight_sync_event_handle = (
                         self.eplb_manager.runtime.weight_sync(layer_id=self.layer_number, async_finish=True)
                     )
