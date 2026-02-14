@@ -1,7 +1,6 @@
 from typing import List, Optional, Tuple, Union, Dict
 
 import torch
-import random
 from megatron.core import utils
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -65,25 +64,27 @@ class EPLBManager:
         # Shape: (num_local_redundant_experts, expert_total_numel)
         self.local_replica_weight_buffer : torch.Tensor = self.runtime.local_replica_weight_buffer
         self.local_replica_grad_buffer : torch.Tensor = self.runtime.local_replica_grad_buffer
-
-    def initialize_placement_random(self, seed: int = 42):
+   
+    @torch.no_grad()
+    def update_placement(self, layer_id: int, routing_map: torch.Tensor):
         """
-        Random placement: each rank randomly selects `num_local_redundant_experts` 
-        experts from OTHER ranks to replicate.
+        Update the placement of the experts based on the routing stats.
+        Uses EPLB-style greedy replication + LPT bin-packing, implemented in C++
+        for minimal overhead. Masters remain fixed; only replica slots are updated.
+        
+        Every rank computes the identical deterministic result, so no broadcast is needed.
+        
+        Args:
+            layer_id: The MoE layer index to update.
+            routing_map: Boolean tensor of shape (num_tokens, num_global_logical_experts),
+                         indicating which tokens are routed to which experts.
         """
-        setup_placement_random(
-            num_ranks=self.num_ranks,
-            num_local_master=self.num_local_master_experts,
-            num_local_redundant=self.num_local_redundant_experts,
-            physical_to_logical_map=self.physical_to_logical_map,
-            logical_to_physical_map=self.logical_to_physical_map,
-            logical_replica_counts=self.logical_replica_counts,
-            replica_distribution="uniform",
-            seed=seed,
-        )
-        self.physical_to_logical_map_gpu = self.physical_to_logical_map.to(device='cuda')
-        self.logical_to_physical_map_gpu = self.logical_to_physical_map.to(device='cuda')
-        self.logical_replica_counts_gpu = self.logical_replica_counts.to(device='cuda')
+        # Sum boolean routing_map along the token dimension to get per-expert load
+        global_logical_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
+        # All-reduce to aggregate loads across all EP ranks
+        torch.distributed.all_reduce(global_logical_expert_loads, group=self.group)
+        # Run the C++ placement algorithm (CPU, deterministic)
+        self.runtime.update_placement(layer_id, global_logical_expert_loads)
     
     def reroute_random(
         self,
@@ -110,8 +111,8 @@ class EPLBManager:
         )
 
         ## Random dispatch
-        logical_to_physical = self.logical_to_physical_map_gpu[layer_id]
-        replica_counts = self.logical_replica_counts_gpu[layer_id]
+        logical_to_physical = self.logical_to_physical_map[layer_id].to(device=device, dtype=torch.int32)
+        replica_counts = self.logical_replica_counts[layer_id].to(device=device, dtype=torch.int32)
         
         # Find all (token, logical_expert) pairs that are routed
         token_indices, logical_indices = routing_map.nonzero(as_tuple=True)

@@ -208,7 +208,6 @@ class MoELayer(BaseMoELayer):
                 config=config,
                 ep_group=self.ep_group,
             )
-            self.eplb_manager.initialize_placement_random()
             # Number of experts to compute = local masters + local replicas
             self.num_local_physical_experts = self.eplb_manager.num_local_physical_experts
             self.num_global_physical_experts = self.eplb_manager.num_global_physical_experts
@@ -552,10 +551,14 @@ class MoELayer(BaseMoELayer):
 
                 # EPLB: expand routing map to include replica assignments
                 if self.eplb_enabled and self.eplb_manager is not None:
-                    routing_map, probs = self.eplb_manager.reroute_random(self.layer_number, routing_map, probs)
+                    # Update replica placement based on real-time expert loads.
+                    self.eplb_manager.update_placement(self.layer_number, routing_map)
+                    # Sync replica weights with masters.
                     self._eplb_weight_sync_event_handle = (
                         self.eplb_manager.runtime.weight_sync(layer_id=self.layer_number, async_finish=True)
                     )
+                    # Reroute tokens to replica experts.
+                    routing_map, probs = self.eplb_manager.reroute_random(self.layer_number, routing_map, probs)
 
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
