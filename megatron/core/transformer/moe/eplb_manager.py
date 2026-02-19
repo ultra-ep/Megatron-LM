@@ -6,7 +6,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     import ultra_ep
-    from ultra_ep.util import setup_placement_random
     HAVE_EPLB = True
 except ImportError:
     HAVE_EPLB = False
@@ -49,6 +48,7 @@ class EPLBManager:
             num_local_redundant_experts=self.num_local_redundant_experts,
             expert_fc1_numel=self.expert_fc1_numel,
             expert_fc2_numel=self.expert_fc2_numel,
+            is_train=True,
             explicitly_destroy=False,
         )
 
@@ -86,68 +86,40 @@ class EPLBManager:
         # Run the C++ placement algorithm (CPU, deterministic)
         self.runtime.update_placement(layer_id, global_logical_expert_loads)
     
-    def reroute_random(
+    def reroute(
         self,
         layer_id: int,
-        routing_map: torch.Tensor,
         probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        backend: str = "cuda",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Expand routing map from [num_tokens, num_global_logical_experts] to 
-        [num_tokens, num_global_physical_experts].
-        
-        """
-        num_tokens = routing_map.shape[0]
-        device = routing_map.device
-        
-        # Must be created from scratch to avoid grad collapse
-        expanded_routing_map = torch.zeros(
-            (num_tokens, self.num_global_physical_experts),
-            dtype=routing_map.dtype, device=device
-        )
-        expanded_probs = torch.zeros(
-            (num_tokens, self.num_global_physical_experts),
-            dtype=probs.dtype, device=device
-        )
+        Expand routing map from [num_tokens, num_global_logical_experts] to
+        [num_tokens, num_global_physical_experts] using deterministic round-robin
+        dispatch across physical replicas.
 
-        ## Random dispatch
-        logical_to_physical = self.logical_to_physical_map[layer_id].to(device=device, dtype=torch.int32)
-        replica_counts = self.logical_replica_counts[layer_id].to(device=device, dtype=torch.int32)
-        
-        # Find all (token, logical_expert) pairs that are routed
-        token_indices, logical_indices = routing_map.nonzero(as_tuple=True)
-        
-        if len(token_indices) == 0:
-            return expanded_routing_map, expanded_probs
-        
-        # Get prob values for these pairs (maintains gradient flow)
-        prob_values = probs[token_indices, logical_indices]
-        
-        # For each routed pair, select a physical expert from the candidates
-        # Vectorized: get replica counts and candidates for each logical expert
-        counts_per_token = replica_counts[logical_indices]
-        
-        # Generate random choices within [0, count) for each token
-        random_vals = torch.rand(len(token_indices), device=device)
-        random_choice = (random_vals * counts_per_token.float()).long()
-        
-        # Gather the physical indices: logical_to_physical[logical_indices, random_choice]
-        physical_indices = logical_to_physical[logical_indices, random_choice]
-        
-        # Set the expanded routing map (no gradient needed for boolean mask)
-        expanded_routing_map[token_indices, physical_indices] = True
-        
-        # For expanded_probs, use scatter to maintain gradient flow
-        # Flatten to 1D for scatter operation
-        flat_indices = token_indices * self.num_global_physical_experts + physical_indices
-        expanded_probs_flat = expanded_probs.view(-1)
-        
-        # scatter is differentiable w.r.t. src (prob_values)
-        expanded_probs = expanded_probs_flat.scatter(
-            0, flat_indices, prob_values
-        ).view(num_tokens, self.num_global_physical_experts) 
-            
-        return expanded_routing_map, expanded_probs
+        For each logical expert l with C_l physical instances, the k-th token
+        (ordered by global token index) is assigned to l2p[l, k % C_l].
+        This ensures even load distribution across replicas.
+
+        Gradient flow is handled via a custom autograd Function:
+          Forward:  expanded_probs[t, phys] = probs[t, logical]  (scatter)
+          Backward: grad_probs[t, logical]  = grad_out[t, phys]   (gather)
+
+        Args:
+            layer_id: MoE layer index.
+            probs: [num_tokens, num_global_logical_experts] float tensor (GPU),
+            routing_map: [num_tokens, num_global_logical_experts] bool tensor (GPU).
+                   may require grad for training.
+            is_train: Whether to use autograd (set False for inference).
+
+        Returns:
+            expanded_probs: [num_tokens, num_global_physical_experts] float.
+            expanded_routing_map: [num_tokens, num_global_physical_experts] bool.
+        """
+        return self.runtime.reroute(
+            layer_id, probs, routing_map, backend
+        )
 
 
 # Global registry for eplb manager instances

@@ -558,7 +558,7 @@ class MoELayer(BaseMoELayer):
                         self.eplb_manager.runtime.weight_sync(layer_id=self.layer_number, async_finish=True)
                     )
                     # Reroute tokens to replica experts.
-                    routing_map, probs = self.eplb_manager.reroute_random(self.layer_number, routing_map, probs)
+                    probs, routing_map = self.eplb_manager.reroute(self.layer_number, probs, routing_map)
 
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
