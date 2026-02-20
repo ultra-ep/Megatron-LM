@@ -79,12 +79,8 @@ class EPLBManager:
             routing_map: Boolean tensor of shape (num_tokens, num_global_logical_experts),
                          indicating which tokens are routed to which experts.
         """
-        # Sum boolean routing_map along the token dimension to get per-expert load
-        global_logical_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
-        # All-reduce to aggregate loads across all EP ranks
-        torch.distributed.all_reduce(global_logical_expert_loads, group=self.group)
         # Run the C++ placement algorithm (CPU, deterministic)
-        self.runtime.update_placement(layer_id, global_logical_expert_loads)
+        self.runtime.update_placement(layer_id, routing_map)
     
     def reroute(
         self,
