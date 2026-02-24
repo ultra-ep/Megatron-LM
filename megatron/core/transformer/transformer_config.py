@@ -704,6 +704,9 @@ class TransformerConfig(ModelParallelConfig):
     """Number of redundant expert replicas each EP rank holds.
     Must be > 0 when moe_enable_eplb is True."""
 
+    moe_eplb_log_expert_loads: bool = False
+    """Log expert loads for EPLB."""
+
     moe_eplb_placement_strategy: str = "random"
     """Strategy for redundant expert placement.
     Options:

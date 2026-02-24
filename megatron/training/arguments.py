@@ -3322,6 +3322,8 @@ def _add_moe_args(parser):
     group.add_argument('--moe-num-redundant-experts-per-rank', type=int, default=0,
                        help='Number of redundant expert replicas each EP rank holds. '
                        'Must be > 0 when moe_enable_eplb is True.')
+    group.add_argument('--moe-eplb-log-expert-loads', action='store_true',
+                       help='Log expert loads for EPLB.')
     group.add_argument('--moe-eplb-placement-strategy', type=str, default='random', choices=['random', 'online'],
                        help='Strategy for redundant expert placement. '
                        'Options are "random" and "online". The default is "random".')
