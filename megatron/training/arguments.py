@@ -1306,6 +1306,10 @@ def validate_args(args, defaults={}):
     
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
+    
+    if args.moe_enable_eplb:
+        assert not args.overlap_grad_reduce, "EPLB does not support overlap_grad_reduce"
+        assert not args.overlap_param_gather, "EPLB does not support overlap_param_gather"
 
     # Print arguments.
     _print_args("arguments", args)
@@ -3322,14 +3326,6 @@ def _add_moe_args(parser):
     group.add_argument('--moe-num-redundant-experts-per-rank', type=int, default=0,
                        help='Number of redundant expert replicas each EP rank holds. '
                        'Must be > 0 when moe_enable_eplb is True.')
-    group.add_argument('--moe-eplb-log-expert-loads', action='store_true',
-                       help='Log expert loads for EPLB.')
-    group.add_argument('--moe-eplb-placement-strategy', type=str, default='random', choices=['random', 'online'],
-                       help='Strategy for redundant expert placement. '
-                       'Options are "random" and "online". The default is "random".')
-    group.add_argument('--moe-eplb-dispatch-strategy', type=str, default='random', choices=['random', 'online'],
-                       help='Strategy for redundant expert dispatcher. '
-                       'Options are "random" and "online". The default is "random".')
     return parser
 
 def _add_mla_args(parser):

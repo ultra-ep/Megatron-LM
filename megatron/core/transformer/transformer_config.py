@@ -704,22 +704,6 @@ class TransformerConfig(ModelParallelConfig):
     """Number of redundant expert replicas each EP rank holds.
     Must be > 0 when moe_enable_eplb is True."""
 
-    moe_eplb_log_expert_loads: bool = False
-    """Log expert loads for EPLB."""
-
-    moe_eplb_placement_strategy: str = "random"
-    """Strategy for redundant expert placement.
-    Options:
-    - 'random': Random placement (strawman implementation)
-    - 'balanced': Future - placement based on historical load
-    - 'online': Future - dynamic placement updated at runtime"""
-
-    moe_eplb_dispatch_strategy: str = "random"
-    """Strategy for dispatching tokens to expert replicas.
-    Options:
-    - 'random': Random dispatch to original or replica with equal probability
-    - 'online': Future - adaptive dispatch based on real-time statistics"""
-
     ##################
     # Context Parallel
     ##################
@@ -1097,16 +1081,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "EPLB requires expert_model_parallel_size > 1"
                 )
-            if self.moe_eplb_placement_strategy not in ["random", "online"]:
-                raise ValueError(
-                    f"Invalid moe_eplb_placement_strategy: {self.moe_eplb_placement_strategy}. "
-                    "Options are 'random', 'online'."
-                )
-            if self.moe_eplb_dispatch_strategy not in ["random", "online"]:
-                raise ValueError(
-                    f"Invalid moe_eplb_dispatch_strategy: {self.moe_eplb_dispatch_strategy}. "
-                    "Options are 'random', 'online'."
-                )
             if self.moe_token_dispatcher_type not in ["alltoall", "flex"]:
                 raise ValueError(
                     f"EPLB only works with alltoall or flex token dispatcher, "
@@ -1114,6 +1088,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.add_bias_linear:
                 raise ValueError("EPLB does not support add_bias_linear")
+
+            if self.expert_tensor_parallel_size != 1:
+                raise ValueError("EPLB does not support expert tensor parallel (ETP)")
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(

@@ -34,14 +34,9 @@ class EPLBManager:
             self.rank * self.num_local_physical_experts + i for i in range(self.num_local_physical_experts)
         ]
         
-        self.placement_strategy = config.moe_eplb_placement_strategy
-        self.dispatch_strategy = config.moe_eplb_dispatch_strategy
-
         self.expert_fc1_numel = 2 * config.hidden_size * config.moe_ffn_hidden_size
         self.expert_fc2_numel = config.hidden_size * config.moe_ffn_hidden_size
         self.expert_total_numel = self.expert_fc1_numel + self.expert_fc2_numel
-
-        self.log_expert_loads = config.moe_eplb_log_expert_loads
 
         self.runtime = ultra_ep.Manager(
             group=self.group,
@@ -52,7 +47,6 @@ class EPLBManager:
             expert_fc2_numel=self.expert_fc2_numel,
             is_train=True,
             explicitly_destroy=False,
-            log_expert_loads=self.log_expert_loads,
         )
 
         # Mirror placement maps (CPU) from runtime
