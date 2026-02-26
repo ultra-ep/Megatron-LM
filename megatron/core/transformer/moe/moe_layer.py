@@ -354,6 +354,11 @@ class MoELayer(BaseMoELayer):
                     .view(module_shape)
                 )
 
+        # Inform TEGroupedMLP how many master experts to include in checkpoints.
+        # This is used by TEGroupedMLP.sharded_state_dict to filter out replicas
+        # and fix the global shape / offset metadata for master expert tensors.
+        self.experts.num_local_master_experts = num_local_master
+
         self._eplb_master_ptrs_registered = False
 
     def _eplb_register_master_experts(self):
