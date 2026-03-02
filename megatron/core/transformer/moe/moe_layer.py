@@ -55,20 +55,17 @@ class _EPLBReplicaGradReduceStartFunction(torch.autograd.Function):
     """
     
     @staticmethod
-    def forward(ctx, hidden_states, moe_layer):
-        """Forward pass: save moe_layer reference and pass through input."""
+    def forward(ctx, hidden_states, moe_layer, virtual_layer_id):
         ctx.moe_layer = moe_layer
+        ctx.virtual_layer_id = virtual_layer_id
         return hidden_states
     
     @staticmethod
     def backward(ctx, grad_output):
-        """Backward pass: trigger EPLB replica gradient reduction.
-        
-        This fires AFTER the MoE layer's backward is complete because we wrap the input.
-        At this point, replica gradients are already computed and in main_grad.
-        """
-        ctx.moe_layer._eplb_start_grad_reduce()
-        return grad_output, None
+        ctx.moe_layer._eplb_start_grad_reduce(
+            virtual_layer_id=ctx.virtual_layer_id
+        )
+        return grad_output, None, None
 
 
 class _EPLBReplicaGradReduceFinishFunction(torch.autograd.Function):
@@ -412,12 +409,13 @@ class MoELayer(BaseMoELayer):
     
     def _eplb_start_grad_reduce(
         self,
+        virtual_layer_id: int,
         mode: str = "low_sm",
         async_finish: bool = True,
     ):
         self._eplb_grad_reduce_event_handle = (
             self.eplb_manager.runtime.grad_reduce(
-                layer_id=self.layer_number,
+                layer_id=virtual_layer_id,
                 mode=mode,
                 async_finish=async_finish,
             )
@@ -548,6 +546,16 @@ class MoELayer(BaseMoELayer):
         if self.eplb_enabled and not self._eplb_master_ptrs_registered:
             self._eplb_register_master_experts()
 
+        # Allocate a virtual layer ID for this micro-batch OUTSIDE custom_forward
+        # so that tensor_parallel.checkpoint (activation recompute) captures the
+        # same ID via closure — both the original forward and the recompute
+        # forward use identical placement / reroute-buffer slots.
+        virtual_layer_id = None
+        if self.eplb_enabled:
+            virtual_layer_id = self.eplb_manager.allocate_microbatch_slot(
+                self.layer_number
+            )
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
             try:
@@ -557,13 +565,17 @@ class MoELayer(BaseMoELayer):
                 # EPLB: expand routing map to include replica assignments
                 if self.eplb_enabled and self.eplb_manager is not None:
                     # Update replica placement based on real-time expert loads.
-                    self.eplb_manager.update_placement(self.layer_number, routing_map)
+                    self.eplb_manager.update_placement(virtual_layer_id, routing_map)
                     # Sync replica weights with masters.
                     self._eplb_weight_sync_event_handle = (
-                        self.eplb_manager.runtime.weight_sync(layer_id=self.layer_number, async_finish=True)
+                        self.eplb_manager.runtime.weight_sync(
+                            layer_id=virtual_layer_id, async_finish=True
+                        )
                     )
                     # Reroute tokens to replica experts.
-                    probs, routing_map = self.eplb_manager.reroute(self.layer_number, probs, routing_map)
+                    probs, routing_map = self.eplb_manager.reroute(
+                        virtual_layer_id, probs, routing_map
+                    )
 
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
@@ -580,7 +592,9 @@ class MoELayer(BaseMoELayer):
             # This ensures replica gradients are reduced after each microbatch's backward
             # (not just the last one like DDP overlap_grad_reduce).
             if self.eplb_enabled:
-                hidden_states = _EPLBReplicaGradReduceStartFunction.apply(hidden_states, self)
+                hidden_states = _EPLBReplicaGradReduceStartFunction.apply(
+                    hidden_states, self, virtual_layer_id
+                )
                 if self._eplb_weight_sync_event_handle is not None:
                     self._eplb_weight_sync_event_handle.current_stream_wait()
                     self._eplb_weight_sync_event_handle = None
