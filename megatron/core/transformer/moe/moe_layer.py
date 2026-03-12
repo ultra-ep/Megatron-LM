@@ -99,6 +99,26 @@ class _EPLBReplicaGradReduceFinishFunction(torch.autograd.Function):
         return grad_output, None
 
 
+class _EPLBWeightSyncFunction(torch.autograd.Function):
+    """Autograd function to sync EPLB replica weights.
+    Used in bprop w/o recompute to sync replica weights with masters.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, moe_layer, virtual_layer_id):
+        ctx.moe_layer = moe_layer
+        ctx.virtual_layer_id = virtual_layer_id
+        return hidden_states
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        ctx.moe_layer.eplb_manager.runtime.weight_sync(
+            layer_id=ctx.virtual_layer_id,
+            async_finish=False,
+        )
+        return grad_output, None, None
+
+
 @dataclass
 class MoESubmodules:
     """MoE Layer Submodule spec"""
@@ -183,6 +203,11 @@ class MoELayer(BaseMoELayer):
         )
         self.moe_layer_recompute = (
             config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
+        )
+        self.is_full_recompute = (
+            config.recompute_granularity == 'full'
+            and config.recompute_method == 'uniform'
+            and config.recompute_num_layers == 1
         )
         self.shared_experts_recompute = (
             config.recompute_granularity == 'selective'
@@ -602,6 +627,11 @@ class MoELayer(BaseMoELayer):
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
+            if not (self.moe_layer_recompute or self.is_full_recompute):
+                # Re-sync replica weights with masters in bprop w/o recompute.
+                output = _EPLBWeightSyncFunction.apply(
+                    output, self, virtual_layer_id
+                )
             return output, mlp_bias
 
         if self.moe_layer_recompute:
