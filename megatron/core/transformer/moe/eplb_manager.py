@@ -53,7 +53,9 @@ class EPLBManager:
         else:
             max_inflight_mbs = pp_size * (vpp_size + 1)
 
-        self.max_microbatches = max(1, max_inflight_mbs)
+        # IMPORTANT: activation checkpointing can increment virtual layer counter
+        # by 2x, so allocate ring buffer for 3x slots to avoid conflicts
+        self.max_microbatches = max(1, max_inflight_mbs) * 3
 
         self.runtime = ultra_ep.Manager(
             group=self.group,
