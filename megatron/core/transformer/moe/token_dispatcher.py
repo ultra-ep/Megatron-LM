@@ -1,8 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-import os
-import numpy as np
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -378,7 +376,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        layer_number_to_dump_expert_load: Optional[int] = None,
         num_global_physical_experts: Optional[int] = None
     ) -> None:
         """
@@ -389,7 +386,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             local_expert_indices (List[int]): Indices of local experts on the current device.
             config (TransformerConfig): Configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
-            layer_number_to_dump_expert_load (int, optional): Layer number for expert load dumping.
             num_global_physical_experts (int, optional): Total number of physical experts across all ranks.
         """
         super().__init__(config=config, pg_collection=pg_collection)
@@ -477,8 +473,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         ]
 
         self.shared_experts = None
-        self.layer_number_to_dump_expert_load = layer_number_to_dump_expert_load
-        self.dispatch_preprocess_id = 1
 
     def set_shared_experts(self, shared_experts):
         """Set shared expert to the dispatcher."""
@@ -563,24 +557,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 .reshape(self.ep_size, self.tp_size, self.num_experts)
                 .transpose(0, 1)
             )
-            if self.layer_number_to_dump_expert_load is not None:
-                # All ranks compute this (no synchronization divergence)
-                global_expert_loads = num_global_tokens_per_expert.sum(dim=(0,1)).cpu().numpy()
-                
-                # Only rank 0 writes to disk
-                if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-                    save_dir = os.environ.get("EP_LOADS_SAVE_DIR", "/var/log/mcore_ep_loads")
-                    os.makedirs(save_dir, exist_ok=True)
-                    save_path = os.path.join(save_dir, f"layer_{self.layer_number_to_dump_expert_load}_mbatch_{self.dispatch_preprocess_id}.npy")
-                    np.save(save_path, global_expert_loads)
-                
-                self.dispatch_preprocess_id += 1
-                max_mbatch_id = int(os.environ.get("EP_LOADS_MAX_MBATCH_NUM", 256))
-                if self.dispatch_preprocess_id > max_mbatch_id:
-                    # Use barrier + proper distributed exit instead of exit()
-                    torch.distributed.barrier()
-                    raise SystemExit(f"EP_LOADS_MAX_MBATCH_NUM {max_mbatch_id} reached, exiting...")
-
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1

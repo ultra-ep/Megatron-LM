@@ -8,7 +8,11 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.expert_load_recorder import (
+    get_or_create_expert_load_recorder,
+)
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -112,10 +116,11 @@ class _EPLBWeightSyncFunction(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_output):
-        ctx.moe_layer.eplb_manager.runtime.weight_sync(
-            layer_id=ctx.virtual_layer_id,
-            async_finish=False,
-        )
+        if ctx.moe_layer.eplb_manager is not None:
+            ctx.moe_layer.eplb_manager.runtime.weight_sync(
+                layer_id=ctx.virtual_layer_id,
+                async_finish=False,
+            )
         return grad_output, None, None
 
 
@@ -243,6 +248,14 @@ class MoELayer(BaseMoELayer):
             self.num_global_physical_experts = self.config.num_moe_experts
             self.local_physical_expert_indices = self.local_master_expert_indices
 
+        self.expert_load_recorder = get_or_create_expert_load_recorder(
+            ep_group=self.ep_group,
+            num_global_physical_experts=self.num_global_physical_experts,
+            num_local_physical_experts=self.num_local_physical_experts,
+        )
+        if self.expert_load_recorder is not None:
+            self.expert_load_recorder.register_layer(self.layer_number)
+
         # Initialize router
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
         self.tp_group = pg_collection.tp
@@ -256,17 +269,11 @@ class MoELayer(BaseMoELayer):
                 pg_collection=pg_collection,
             )
         elif config.moe_token_dispatcher_type == "alltoall":
-            if self.layer_number in config.layer_numbers_to_dump_expert_load:
-                # Expert load dumping only supports all2all dispatcher
-                layer_number_to_dump_expert_load = self.layer_number
-            else:
-                layer_number_to_dump_expert_load = None
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
                 self.num_local_physical_experts,
                 self.local_physical_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
-                layer_number_to_dump_expert_load=layer_number_to_dump_expert_load,
                 num_global_physical_experts=self.num_global_physical_experts,
             )
         elif config.moe_token_dispatcher_type == "flex":
@@ -485,6 +492,18 @@ class MoELayer(BaseMoELayer):
         """
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
+    def _should_capture_expert_load(self) -> bool:
+        """Capture only on real forwards, not CUDA-graph replay or recompute."""
+        if self.expert_load_recorder is None:
+            return False
+        if is_graph_capturing() or not self.cudagraph_tensor_store.is_empty():
+            return False
+        if self.training and (
+            self.moe_layer_recompute or self.config.recompute_granularity == "full"
+        ):
+            return not torch.is_grad_enabled()
+        return True
+
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
         """Computes the output of the shared experts.
@@ -611,6 +630,9 @@ class MoELayer(BaseMoELayer):
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
+            if self._should_capture_expert_load():
+                self.expert_load_recorder.capture(self.layer_number, routing_map)
+
             # EPLB: Wrap input with autograd function to trigger replica gradient reduction
             # during backward pass. By wrapping the INPUT, the wrapper's backward fires AFTER
             # the MoE layer's backward is complete (when gradients are in main_grad).
@@ -627,7 +649,7 @@ class MoELayer(BaseMoELayer):
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
-            if not (self.moe_layer_recompute or self.is_full_recompute):
+            if self.eplb_enabled and not (self.moe_layer_recompute or self.is_full_recompute):
                 # Re-sync replica weights with masters in bprop w/o recompute.
                 output = _EPLBWeightSyncFunction.apply(
                     output, self, virtual_layer_id
