@@ -67,6 +67,7 @@ class EPLBManager:
             is_train=True,
             explicitly_destroy=False,
             max_microbatches=self.max_microbatches,
+            use_quota_eplb_solver=True,
         )
 
         # Mirror placement maps (CPU) from runtime
