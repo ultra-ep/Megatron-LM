@@ -1307,10 +1307,6 @@ def validate_args(args, defaults={}):
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
     
-    if args.moe_enable_eplb:
-        assert not args.overlap_grad_reduce, "EPLB does not support overlap_grad_reduce"
-        assert not args.overlap_param_gather, "EPLB does not support overlap_param_gather"
-
     # Print arguments.
     _print_args("arguments", args)
 

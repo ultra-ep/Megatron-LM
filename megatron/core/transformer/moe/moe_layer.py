@@ -100,6 +100,9 @@ class _EPLBReplicaGradReduceFinishFunction(torch.autograd.Function):
         """Backward pass: finish EPLB replica gradient reduction.
         """        
         ctx.moe_layer._eplb_finish_grad_reduce()
+        # EPLB master expert params are deferred in DDP backward hooks. Trigger
+        # their ready-registration only after EPLB replica grad-reduce finishes.
+        ctx.moe_layer._eplb_register_master_grad_ready()
         return grad_output, None
 
 
@@ -358,6 +361,15 @@ class MoELayer(BaseMoELayer):
                 module_shape = expert_weight0.shape
                 expert_data_range = slice(expert_fc1_numel, expert_total_numel)
 
+            # Mark EPLB master experts so their DDP ready-registration can be
+            # deferred until replica grad-reduce completion.
+            for expert_idx in range(num_local_master):
+                master_weight = getattr(linear_module, f'weight{expert_idx}', None)
+                assert master_weight is not None, (
+                    f"weight{expert_idx} is not found in {linear_module}"
+                )
+                setattr(master_weight, 'is_eplb_master', True)
+
             # Only process replica experts (indices >= num_local_master)
             for expert_idx in range(num_local_master, num_local_physical):
                 local_replica_offset = expert_idx - num_local_master
@@ -370,6 +382,7 @@ class MoELayer(BaseMoELayer):
                 #   - _ParamAndGradBuffer skips weight & grad buffer allocation
                 #   - Distributed optimizer skips optimizer state allocation
                 setattr(replica_weight, 'is_eplb_replica', True)
+                setattr(replica_weight, 'is_eplb_master', False)
 
                 # Re-point .data and .main_grad to views in UltraEP's cross-layer
                 # shared buffers.  _ParamAndGradBuffer will skip is_eplb_replica
@@ -455,6 +468,24 @@ class MoELayer(BaseMoELayer):
         if self._eplb_grad_reduce_event_handle is not None:
             self._eplb_grad_reduce_event_handle.current_stream_wait()
             self._eplb_grad_reduce_event_handle = None
+
+    def _eplb_register_master_grad_ready(self):
+        """Manually register EPLB master expert grads as ready in DDP.
+
+        EPLB master params skip ``register_grad_ready`` in DDP backward hooks to
+        avoid racing with asynchronous EPLB replica->master grad reduce. After
+        ``_eplb_finish_grad_reduce`` establishes stream dependency, this method
+        marks master expert params ready so bucketed DDP communication can start.
+        """
+        for param in self.experts.parameters():
+            if not getattr(param, 'is_eplb_master', False):
+                continue
+            bucket_group = getattr(param, '_ddp_bucket_group', None)
+            if bucket_group is None:
+                continue
+            if not bucket_group.ddp_config.overlap_grad_reduce:
+                continue
+            bucket_group.register_grad_ready(param)
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor):
