@@ -124,10 +124,6 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         MultiStorageClientFeature.disable()
         assert MultiStorageClientFeature.is_enabled() is False
         print('WARNING: The MSC feature is disabled.')
-    
-    if args.layer_numbers_to_dump_expert_load:
-        assert args.moe_token_dispatcher_type == "alltoall", \
-            "layer_numbers_to_dump_expert_load is only supported with alltoall token dispatcher."
 
     return args
 
@@ -1306,7 +1302,7 @@ def validate_args(args, defaults={}):
     
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
-    
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -3277,15 +3273,11 @@ def _add_moe_args(parser):
     group.add_argument('--moe-enable-deepep', action='store_true',
                        help='DEPRECATED: Please use --moe-flex-dispatcher-backend=deepep instead.')
     group.add_argument('--moe-flex-dispatcher-backend', type=str,
-                       choices=['deepep', 'hybridep', 'deepep-v2'],
+                       choices=['deepep', 'hybridep'],
                        default='deepep',
-                       help='The backend to use for flex token dispatcher. The default is "deepep". Options are "deepep", "hybridep" and "deepep-v2".')
+                       help='The backend to use for flex token dispatcher. The default is "deepep". Options are "deepep" and "hybridep".')
     group.add_argument('--moe-deepep-num-sms', type=int, default=20,
                        help='Number of SMs to use for DeepEP.')
-    group.add_argument('--moe-deepep-v2-dispatch-sms', type=int, default=32,
-                       help='Number of SMs to use for DeepEP v2 dispatch.')
-    group.add_argument('--moe-deepep-v2-combine-sms', type=int, default=32,
-                       help='Number of SMs to use for DeepEP v2 combine.')
     group.add_argument('--moe-hybridep-num-sms', type=int, default=16,
                        help='Number of SMs to use for HybridEP.')
     group.add_argument('--moe-permute-fusion', action='store_true',
@@ -3501,12 +3493,6 @@ def _add_experimental_args(parser):
                             'precision-aware-optimizer. This dtype is used for storing the '
                             'optimizer state in memory during training but does not affect '
                             'the precision in the kernel computation.')
-    group.add_argument('--vram-profile-iters', nargs='+', type=int, default=[],
-                       help='Iterations to profile VRAM usage.')
-    group.add_argument('--vram-snapshot-save-dir', type=str, default=None,
-                       help='Directory to save VRAM snapshot pickle files.')
-    group.add_argument('--layer-numbers-to-dump-expert-load', nargs='+', type=int, default=[],
-                       help='Layer numbers to dump expert load.')
     return parser
 
 

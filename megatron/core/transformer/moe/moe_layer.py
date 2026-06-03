@@ -8,11 +8,7 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.expert_load_recorder import (
-    get_or_create_expert_load_recorder,
-)
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -250,14 +246,6 @@ class MoELayer(BaseMoELayer):
             self.num_local_physical_experts = self.num_local_master_experts
             self.num_global_physical_experts = self.config.num_moe_experts
             self.local_physical_expert_indices = self.local_master_expert_indices
-
-        self.expert_load_recorder = get_or_create_expert_load_recorder(
-            ep_group=self.ep_group,
-            num_global_physical_experts=self.num_global_physical_experts,
-            num_local_physical_experts=self.num_local_physical_experts,
-        )
-        if self.expert_load_recorder is not None:
-            self.expert_load_recorder.register_layer(self.layer_number)
 
         # Initialize router
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
@@ -521,18 +509,6 @@ class MoELayer(BaseMoELayer):
         """
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
-    def _should_capture_expert_load(self) -> bool:
-        """Capture only on real forwards, not CUDA-graph replay or recompute."""
-        if self.expert_load_recorder is None:
-            return False
-        if is_graph_capturing() or not self.cudagraph_tensor_store.is_empty():
-            return False
-        if self.training and (
-            self.moe_layer_recompute or self.config.recompute_granularity == "full"
-        ):
-            return not torch.is_grad_enabled()
-        return True
-
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
         """Computes the output of the shared experts.
@@ -658,9 +634,6 @@ class MoELayer(BaseMoELayer):
                 # like cuda_graph_scope=["moe_router", "moe_preprocess"].
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
-
-            if self._should_capture_expert_load():
-                self.expert_load_recorder.capture(self.layer_number, routing_map)
 
             # EPLB: Wrap input with autograd function to trigger replica gradient reduction
             # during backward pass. By wrapping the INPUT, the wrapper's backward fires AFTER
