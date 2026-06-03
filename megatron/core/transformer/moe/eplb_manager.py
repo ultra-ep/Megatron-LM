@@ -67,16 +67,7 @@ class EPLBManager:
             is_train=True,
             explicitly_destroy=False,
             max_microbatches=self.max_microbatches,
-            use_quota_eplb_solver=True,
         )
-
-        # Mirror placement maps (CPU) from runtime
-        self.physical_to_logical_map : torch.Tensor = self.runtime.physical_to_logical_map
-        self.logical_to_physical_map : torch.Tensor = self.runtime.logical_to_physical_map
-        self.logical_replica_counts : torch.Tensor = self.runtime.logical_replica_counts
-        self.physical_to_logical_map_gpu : Optional[torch.Tensor] = None
-        self.logical_to_physical_map_gpu : Optional[torch.Tensor] = None
-        self.logical_replica_counts_gpu : Optional[torch.Tensor] = None
 
         # Mirror replica weight and grad buffers (GPU) from runtime
         # Shape: (num_local_redundant_experts, expert_total_numel)
@@ -96,7 +87,7 @@ class EPLBManager:
             layer_id: Virtual layer ID (from ``allocate_microbatch_slot``).
             routing_map: ``[num_tokens, num_global_logical_experts]`` bool tensor.
         """
-        # Run the C++ placement algorithm (CPU, deterministic)
+        # Run the C++ placement algorithm on device.
         self.runtime.update_placement(layer_id, routing_map)
     
     def reroute(
@@ -123,7 +114,7 @@ class EPLBManager:
             layer_id: Virtual layer ID (from ``allocate_microbatch_slot``).
             probs: ``[num_tokens, num_global_logical_experts]`` float (GPU).
             routing_map: ``[num_tokens, num_global_logical_experts]`` bool (GPU).
-            backend: ``"cuda"`` (fused kernel) or ``"cpu"`` (index arrays).
+            backend: reroute backend selector. Only ``"cuda"`` is supported.
 
         Returns:
             ``(expanded_probs, expanded_routing_map)`` in the physical expert space.

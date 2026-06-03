@@ -442,13 +442,11 @@ class MoELayer(BaseMoELayer):
     def _eplb_start_grad_reduce(
         self,
         virtual_layer_id: int,
-        mode: str = "low_sm",
         async_finish: bool = True,
     ):
         self._eplb_grad_reduce_event_handle = (
             self.eplb_manager.runtime.grad_reduce(
                 layer_id=virtual_layer_id,
-                mode=mode,
                 async_finish=async_finish,
             )
         )
