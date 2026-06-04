@@ -687,14 +687,14 @@ class TransformerConfig(ModelParallelConfig):
     ##################
     # EPLB (Expert Parallel Load Balancing)
     ##################
-    moe_enable_eplb: bool = False
+    moe_enable_ultraep: bool = False
     """Enable EPLB with redundant experts for better load balancing.
     When enabled, each EP rank holds additional redundant expert replicas
     that can be used to balance the load across experts."""
 
     moe_num_redundant_experts_per_rank: int = 0
     """Number of redundant expert replicas each EP rank holds.
-    Must be > 0 when moe_enable_eplb is True."""
+    Must be > 0 when moe_enable_ultraep is True."""
 
     ##################
     # Context Parallel
@@ -1062,10 +1062,10 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         # EPLB validation
-        if self.moe_enable_eplb:
+        if self.moe_enable_ultraep:
             if self.moe_num_redundant_experts_per_rank <= 0:
                 raise ValueError(
-                    "moe_num_redundant_experts_per_rank must be > 0 when moe_enable_eplb is True"
+                    "moe_num_redundant_experts_per_rank must be > 0 when moe_enable_ultraep is True"
                 )
             if self.expert_model_parallel_size <= 1:
                 raise ValueError(

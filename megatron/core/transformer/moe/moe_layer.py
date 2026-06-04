@@ -221,7 +221,7 @@ class MoELayer(BaseMoELayer):
         self.local_master_expert_indices = self.local_expert_indices
 
         # Initialize EPLB Manager (if enabled)
-        self.eplb_enabled = config.moe_enable_eplb
+        self.eplb_enabled = config.moe_enable_ultraep
         self.eplb_manager = None
         
         if self.eplb_enabled:
