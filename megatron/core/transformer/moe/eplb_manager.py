@@ -69,10 +69,15 @@ class EPLBManager:
             max_microbatches=self.max_microbatches,
         )
 
-        # Mirror replica weight and grad buffers (GPU) from runtime
-        # Shape: (num_local_redundant_experts, expert_total_numel)
-        self.local_replica_weight_buffer : torch.Tensor = self.runtime.local_replica_weight_buffer
-        self.local_replica_grad_buffer : torch.Tensor = self.runtime.local_replica_grad_buffer
+        # Mirror replica buffers (GPU) from runtime. Full buffers remain available
+        # for compatibility; fc1/fc2 buffers are strided views whose expert rows
+        # are contiguous, with rows separated by the full-expert stride.
+        self.local_replica_weight_buffer: torch.Tensor = self.runtime.local_replica_weight_buffer
+        self.local_replica_fc1_weight_buffer: torch.Tensor = self.runtime.local_replica_fc1_weight_buffer
+        self.local_replica_fc2_weight_buffer: torch.Tensor = self.runtime.local_replica_fc2_weight_buffer
+        self.local_replica_grad_buffer: torch.Tensor = self.runtime.local_replica_grad_buffer
+        self.local_replica_fc1_grad_buffer: torch.Tensor = self.runtime.local_replica_fc1_grad_buffer
+        self.local_replica_fc2_grad_buffer: torch.Tensor = self.runtime.local_replica_fc2_grad_buffer
    
     @torch.no_grad()
     def update_placement(self, layer_id: int, routing_map: torch.Tensor):

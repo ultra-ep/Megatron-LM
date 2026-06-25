@@ -334,20 +334,27 @@ class MoELayer(BaseMoELayer):
         num_local_physical = num_local_master + num_local_redundant
         expert_fc1_numel = self.eplb_manager.expert_fc1_numel
         expert_fc2_numel = self.eplb_manager.expert_fc2_numel
-        expert_total_numel = self.eplb_manager.expert_total_numel
-        local_replica_weight_buffer = self.eplb_manager.local_replica_weight_buffer
-        local_replica_grad_buffer = self.eplb_manager.local_replica_grad_buffer
+        local_replica_weight_buffers = [
+            self.eplb_manager.local_replica_fc1_weight_buffer,
+            self.eplb_manager.local_replica_fc2_weight_buffer,
+        ]
+        local_replica_grad_buffers = [
+            self.eplb_manager.local_replica_fc1_grad_buffer,
+            self.eplb_manager.local_replica_fc2_grad_buffer,
+        ]
 
+        # UltraEP exposes fc1/fc2 as strided views into the full replica buffers:
+        # each expert row is contiguous, while rows are separated by full-expert stride.
         for module_idx, linear_module in enumerate([self.experts.linear_fc1, self.experts.linear_fc2]):
             expert_weight0 = getattr(linear_module, 'weight0', None)
             if module_idx == 0:
                 assert expert_fc1_numel == expert_weight0.numel()
                 module_shape = expert_weight0.shape
-                expert_data_range = slice(0, expert_fc1_numel)
             else:
                 assert expert_fc2_numel == expert_weight0.numel()
                 module_shape = expert_weight0.shape
-                expert_data_range = slice(expert_fc1_numel, expert_total_numel)
+            local_replica_weight_buffer = local_replica_weight_buffers[module_idx]
+            local_replica_grad_buffer = local_replica_grad_buffers[module_idx]
 
             # Mark EPLB master experts so their DDP ready-registration can be
             # deferred until replica grad-reduce completion.
@@ -375,14 +382,12 @@ class MoELayer(BaseMoELayer):
                 # Re-point .data and .main_grad to views in UltraEP's cross-layer
                 # shared buffers.  _ParamAndGradBuffer will skip is_eplb_replica
                 # params, so these assignments are preserved.
-                replica_weight.data = (
-                    local_replica_weight_buffer[local_replica_offset, expert_data_range]
-                    .view(module_shape)
-                )
-                replica_weight.main_grad = (
-                    local_replica_grad_buffer[local_replica_offset, expert_data_range]
-                    .view(module_shape)
-                )
+                replica_weight.data = local_replica_weight_buffer[
+                    local_replica_offset
+                ].view(module_shape)
+                replica_weight.main_grad = local_replica_grad_buffer[
+                    local_replica_offset
+                ].view(module_shape)
 
         # Inform TEGroupedMLP how many master experts to include in checkpoints.
         # This is used by TEGroupedMLP.sharded_state_dict to filter out replicas
