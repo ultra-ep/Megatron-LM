@@ -24,6 +24,8 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.moe.experts import TEGroupedMLP
+from megatron.core.transformer.moe.eplb_manager import HAVE_EPLB, get_or_create_eplb_manager
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -33,6 +35,92 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+
+class _EPLBReplicaGradReduceStartFunction(torch.autograd.Function):
+    """Autograd function to trigger EPLB replica gradient reduction during backward.
+    
+    This function wraps the MoE INPUT (not output) so that its backward fires AFTER
+    the MoE layer's backward is complete. The backward execution order is:
+    
+    Forward:  input → [wrap] → MoE forward → output
+    Backward: output_grad → MoE backward → [wrap backward] → input_grad
+    
+    By wrapping the input, the wrapper's backward fires after MoE backward completes,
+    which means replica gradients are already in main_grad and ready for reduction.
+    
+    The reduction happens for EVERY microbatch (unlike DDP which only reduces on
+    the last microbatch) because replica gradients must be aggregated to master
+    experts immediately for correct gradient accumulation.
+    """
+    
+    @staticmethod
+    def forward(ctx, hidden_states, moe_layer, virtual_layer_id):
+        ctx.moe_layer = moe_layer
+        ctx.virtual_layer_id = virtual_layer_id
+        return hidden_states
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        ctx.moe_layer._eplb_start_grad_reduce(
+            virtual_layer_id=ctx.virtual_layer_id
+        )
+        return grad_output, None, None
+
+
+class _EPLBReplicaGradReduceFinishFunction(torch.autograd.Function):
+    """Autograd function to finish EPLB replica gradient reduction during backward.
+    
+    This function wraps the MoE INPUT (not output) so that its backward fires AFTER
+    the MoE layer's backward is complete. The backward execution order is:
+    
+    Forward:  input → [wrap] → MoE forward → output
+    Backward: output_grad → MoE backward → [wrap backward] → input_grad
+    
+    By wrapping the input, the wrapper's backward fires after MoE backward completes,
+    which means replica gradients are already in main_grad and ready for reduction.
+    
+    The reduction happens for EVERY microbatch (unlike DDP which only reduces on
+    the last microbatch) because replica gradients must be aggregated to master
+    experts immediately for correct gradient accumulation.
+    """
+    
+    @staticmethod
+    def forward(ctx, hidden_states, moe_layer):
+        """Forward pass: save moe_layer reference and pass through input."""
+        ctx.moe_layer = moe_layer
+        return hidden_states
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: finish EPLB replica gradient reduction.
+        """        
+        ctx.moe_layer._eplb_finish_grad_reduce()
+        # EPLB master expert params are deferred in DDP backward hooks. Trigger
+        # their ready-registration only after EPLB replica grad-reduce finishes.
+        ctx.moe_layer._eplb_register_master_grad_ready()
+        return grad_output, None
+
+
+class _EPLBWeightSyncFunction(torch.autograd.Function):
+    """Autograd function to sync EPLB replica weights.
+    Used in bprop w/o recompute to sync replica weights with masters.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, moe_layer, virtual_layer_id):
+        ctx.moe_layer = moe_layer
+        ctx.virtual_layer_id = virtual_layer_id
+        return hidden_states
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.moe_layer.eplb_manager is not None:
+            ctx.moe_layer.eplb_manager.runtime.weight_sync(
+                layer_id=ctx.virtual_layer_id,
+                async_finish=False,
+            )
+        return grad_output, None, None
 
 
 @dataclass
@@ -120,16 +208,51 @@ class MoELayer(BaseMoELayer):
         self.moe_layer_recompute = (
             config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
         )
+        self.is_full_recompute = (
+            config.recompute_granularity == 'full'
+            and config.recompute_method == 'uniform'
+            and config.recompute_num_layers == 1
+        )
         self.shared_experts_recompute = (
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        self.num_local_master_experts = self.num_local_experts
+        self.local_master_expert_indices = self.local_expert_indices
+
+        # Initialize EPLB Manager (if enabled)
+        self.eplb_enabled = config.moe_enable_ultraep
+        self.eplb_manager = None
+        
+        if self.eplb_enabled:
+            if not HAVE_EPLB:
+                raise ImportError(
+                    "EPLB is enabled but eplb module could not be imported. "
+                    "Please ensure megatron.core.transformer.moe.eplb is available."
+                )
+            self.eplb_manager = get_or_create_eplb_manager(
+                config=config,
+                ep_group=self.ep_group,
+            )
+            # Number of experts to compute = local masters + local replicas
+            self.num_local_physical_experts = self.eplb_manager.num_local_physical_experts
+            self.num_global_physical_experts = self.eplb_manager.num_global_physical_experts
+            self.local_physical_expert_indices = self.eplb_manager.local_physical_expert_indices
+            # Event handles
+            self._eplb_grad_reduce_event_handle = None
+            self._eplb_weight_sync_event_handle = None
+
+        else:
+            self.num_local_physical_experts = self.num_local_master_experts
+            self.num_global_physical_experts = self.config.num_moe_experts
+            self.local_physical_expert_indices = self.local_master_expert_indices
 
         # Initialize router
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
         self.tp_group = pg_collection.tp
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
+            # All Gather dispatcher does not support EPLB
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
@@ -138,17 +261,19 @@ class MoELayer(BaseMoELayer):
             )
         elif config.moe_token_dispatcher_type == "alltoall":
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
+                self.num_local_physical_experts,
+                self.local_physical_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
+                num_global_physical_experts=self.num_global_physical_experts,
             )
         elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
+                self.num_local_physical_experts,
+                self.local_physical_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
+                num_global_physical_experts=self.num_global_physical_experts,
             )
         else:
             raise ValueError(
@@ -156,12 +281,20 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize experts
+        # When EPLB is enabled, we need to allocate extra capacity for replica experts
         self.experts = build_module(
             self.submodules.experts,
-            self.num_local_experts,
+            self.num_local_physical_experts,  # Includes replicas when EPLB is enabled
             self.config,
             pg_collection=pg_collection,
         )
+        self._eplb_master_ptrs_registered = not self.eplb_enabled
+        if self.eplb_enabled:
+            assert isinstance(self.experts, TEGroupedMLP), \
+                f"experts must be a TEGroupedMLP when EPLB is enabled, but got {type(self.experts)}"
+            # Phase 1: mark replicas and set their data/grad to shared UltraEP buffers.
+            self._eplb_register_redundant_experts()
+            # Phase 2 (_eplb_register_master_experts) must be called after DDP init.
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -176,6 +309,176 @@ class MoELayer(BaseMoELayer):
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
+
+    def _eplb_register_redundant_experts(self):
+        """Phase 1: Register replica expert weights and grads with shared UltraEP buffers.
+
+        Called during model initialization, BEFORE DDP / _ParamAndGradBuffer init.
+
+        This method:
+            - Marks replica weight parameters with ``is_eplb_replica = True`` so that
+              _ParamAndGradBuffer skips allocating weight and gradient buffer space
+              for them (they use cross-layer shared buffers from UltraEP instead).
+            - Re-points each replica weight's ``.data`` and ``.main_grad`` to the
+              corresponding views in UltraEP's shared buffers.  Because
+              _ParamAndGradBuffer skips ``is_eplb_replica`` params, these assignments
+              are never overwritten.
+
+        Master expert pointer registration (``construct_local_master_ptr_pool``)
+        is deferred to :meth:`_eplb_register_master_experts`, which MUST be called
+        after DDP initialization completes (when ``main_grad`` has been assigned to
+        master weights by ``_ParamAndGradBuffer``).
+        """
+        num_local_master = self.eplb_manager.num_local_master_experts
+        num_local_redundant = self.eplb_manager.num_local_redundant_experts
+        num_local_physical = num_local_master + num_local_redundant
+        expert_fc1_numel = self.eplb_manager.expert_fc1_numel
+        expert_fc2_numel = self.eplb_manager.expert_fc2_numel
+        local_replica_weight_buffers = [
+            self.eplb_manager.local_replica_fc1_weight_buffer,
+            self.eplb_manager.local_replica_fc2_weight_buffer,
+        ]
+        local_replica_grad_buffers = [
+            self.eplb_manager.local_replica_fc1_grad_buffer,
+            self.eplb_manager.local_replica_fc2_grad_buffer,
+        ]
+
+        # UltraEP exposes fc1/fc2 as strided views into the full replica buffers:
+        # each expert row is contiguous, while rows are separated by full-expert stride.
+        for module_idx, linear_module in enumerate([self.experts.linear_fc1, self.experts.linear_fc2]):
+            expert_weight0 = getattr(linear_module, 'weight0', None)
+            if module_idx == 0:
+                assert expert_fc1_numel == expert_weight0.numel()
+                module_shape = expert_weight0.shape
+            else:
+                assert expert_fc2_numel == expert_weight0.numel()
+                module_shape = expert_weight0.shape
+            local_replica_weight_buffer = local_replica_weight_buffers[module_idx]
+            local_replica_grad_buffer = local_replica_grad_buffers[module_idx]
+
+            # Mark EPLB master experts so their DDP ready-registration can be
+            # deferred until replica grad-reduce completion.
+            for expert_idx in range(num_local_master):
+                master_weight = getattr(linear_module, f'weight{expert_idx}', None)
+                assert master_weight is not None, (
+                    f"weight{expert_idx} is not found in {linear_module}"
+                )
+                setattr(master_weight, 'is_eplb_master', True)
+
+            # Only process replica experts (indices >= num_local_master)
+            for expert_idx in range(num_local_master, num_local_physical):
+                local_replica_offset = expert_idx - num_local_master
+                replica_weight = getattr(linear_module, f'weight{expert_idx}', None)
+                assert replica_weight is not None, (
+                    f"weight{expert_idx} is not found in {linear_module}"
+                )
+
+                # Mark as EPLB replica so that:
+                #   - _ParamAndGradBuffer skips weight & grad buffer allocation
+                #   - Distributed optimizer skips optimizer state allocation
+                setattr(replica_weight, 'is_eplb_replica', True)
+                setattr(replica_weight, 'is_eplb_master', False)
+
+                # Re-point .data and .main_grad to views in UltraEP's cross-layer
+                # shared buffers.  _ParamAndGradBuffer will skip is_eplb_replica
+                # params, so these assignments are preserved.
+                replica_weight.data = local_replica_weight_buffer[
+                    local_replica_offset
+                ].view(module_shape)
+                replica_weight.main_grad = local_replica_grad_buffer[
+                    local_replica_offset
+                ].view(module_shape)
+
+        # Inform TEGroupedMLP how many master experts to include in checkpoints.
+        # This is used by TEGroupedMLP.sharded_state_dict to filter out replicas
+        # and fix the global shape / offset metadata for master expert tensors.
+        self.experts.num_local_master_experts = num_local_master
+
+        self._eplb_master_ptrs_registered = False
+
+    def _eplb_register_master_experts(self):
+        """Phase 2: Register master expert weight/grad pointers with UltraEP runtime.
+
+        MUST be called AFTER DDP initialization (``_ParamAndGradBuffer`` has mapped
+        master expert weights to contiguous ``param_data`` and assigned ``main_grad``
+        from ``grad_data``).
+
+        This method collects the **final** ``.data`` and ``.main_grad`` tensor
+        pointers for master experts and passes them to UltraEP's
+        ``construct_local_master_ptr_pool`` so that ``weight_sync`` and
+        ``grad_reduce`` operations can locate the correct device memory.
+        """
+        if self._eplb_master_ptrs_registered:
+            return
+
+        num_local_master = self.eplb_manager.num_local_master_experts
+
+        master_fc1_weights = []
+        master_fc2_weights = []
+        master_fc1_grads = []
+        master_fc2_grads = []
+
+        for module_idx, linear_module in enumerate([self.experts.linear_fc1, self.experts.linear_fc2]):
+            for expert_idx in range(num_local_master):
+                master_weight = getattr(linear_module, f'weight{expert_idx}', None)
+                assert master_weight is not None, (
+                    f"weight{expert_idx} is not found in {linear_module}"
+                )
+                assert hasattr(master_weight, 'main_grad'), (
+                    f"weight{expert_idx}.main_grad not found in {linear_module}. "
+                    f"_eplb_register_master_experts() must be called after DDP initialization."
+                )
+
+                if module_idx == 0:
+                    master_fc1_weights.append(master_weight.data)
+                    master_fc1_grads.append(master_weight.main_grad)
+                else:
+                    master_fc2_weights.append(master_weight.data)
+                    master_fc2_grads.append(master_weight.main_grad)
+
+        self.eplb_manager.runtime.construct_local_master_ptr_pool(
+            layer_id=self.layer_number,
+            fc1_weights=master_fc1_weights,
+            fc2_weights=master_fc2_weights,
+            fc1_grads=master_fc1_grads,
+            fc2_grads=master_fc2_grads,
+        )
+        self._eplb_master_ptrs_registered = True
+    
+    def _eplb_start_grad_reduce(
+        self,
+        virtual_layer_id: int,
+        async_finish: bool = True,
+    ):
+        self._eplb_grad_reduce_event_handle = (
+            self.eplb_manager.runtime.grad_reduce(
+                layer_id=virtual_layer_id,
+                async_finish=async_finish,
+            )
+        )
+
+    def _eplb_finish_grad_reduce(self):
+        if self._eplb_grad_reduce_event_handle is not None:
+            self._eplb_grad_reduce_event_handle.current_stream_wait()
+            self._eplb_grad_reduce_event_handle = None
+
+    def _eplb_register_master_grad_ready(self):
+        """Manually register EPLB master expert grads as ready in DDP.
+
+        EPLB master params skip ``register_grad_ready`` in DDP backward hooks to
+        avoid racing with asynchronous EPLB replica->master grad reduce. After
+        ``_eplb_finish_grad_reduce`` establishes stream dependency, this method
+        marks master expert params ready so bucketed DDP communication can start.
+        """
+        for param in self.experts.parameters():
+            if not getattr(param, 'is_eplb_master', False):
+                continue
+            bucket_group = getattr(param, '_ddp_bucket_group', None)
+            if bucket_group is None:
+                continue
+            if not bucket_group.ddp_config.overlap_grad_reduce:
+                continue
+            bucket_group.register_grad_ready(param)
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor):
@@ -291,11 +594,43 @@ class MoELayer(BaseMoELayer):
                 "are enabled without also enabling sequence parallelism."
             )
 
+        # Lazily finalize EPLB master pointer registration after DDP init.
+        # This is a safety net; callers should ideally invoke
+        # _eplb_register_master_experts() explicitly after DDP construction.
+        if self.eplb_enabled and not self._eplb_master_ptrs_registered:
+            self._eplb_register_master_experts()
+
+        # Allocate a virtual layer ID for this micro-batch OUTSIDE custom_forward
+        # so that tensor_parallel.checkpoint (activation recompute) captures the
+        # same ID via closure — both the original forward and the recompute
+        # forward use identical placement / reroute-buffer slots.
+        virtual_layer_id = None
+        if self.eplb_enabled:
+            virtual_layer_id = self.eplb_manager.allocate_microbatch_slot(
+                self.layer_number
+            )
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map = self.route(hidden_states)
+
+                # EPLB: expand routing map to include replica assignments
+                if self.eplb_enabled and self.eplb_manager is not None:
+                    # Update replica placement based on real-time expert loads.
+                    self.eplb_manager.update_placement(virtual_layer_id, routing_map)
+                    # Sync replica weights with masters.
+                    self._eplb_weight_sync_event_handle = (
+                        self.eplb_manager.runtime.weight_sync(
+                            layer_id=virtual_layer_id, async_finish=True
+                        )
+                    )
+                    # Reroute tokens to replica experts.
+                    probs, routing_map = self.eplb_manager.reroute(
+                        virtual_layer_id, probs, routing_map
+                    )
+
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
@@ -305,9 +640,27 @@ class MoELayer(BaseMoELayer):
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
+            # EPLB: Wrap input with autograd function to trigger replica gradient reduction
+            # during backward pass. By wrapping the INPUT, the wrapper's backward fires AFTER
+            # the MoE layer's backward is complete (when gradients are in main_grad).
+            # This ensures replica gradients are reduced after each microbatch's backward
+            # (not just the last one like DDP overlap_grad_reduce).
+            if self.eplb_enabled:
+                hidden_states = _EPLBReplicaGradReduceStartFunction.apply(
+                    hidden_states, self, virtual_layer_id
+                )
+                if self._eplb_weight_sync_event_handle is not None:
+                    self._eplb_weight_sync_event_handle.current_stream_wait()
+                    self._eplb_weight_sync_event_handle = None
+
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
+            if self.eplb_enabled and not (self.moe_layer_recompute or self.is_full_recompute):
+                # Re-sync replica weights with masters in bprop w/o recompute.
+                output = _EPLBWeightSyncFunction.apply(
+                    output, self, virtual_layer_id
+                )
             return output, mlp_bias
 
         if self.moe_layer_recompute:

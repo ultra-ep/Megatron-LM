@@ -685,6 +685,18 @@ class TransformerConfig(ModelParallelConfig):
     """Apply probs on input of experts instead of applying after activation and glu."""
 
     ##################
+    # EPLB (Expert Parallel Load Balancing)
+    ##################
+    moe_enable_ultraep: bool = False
+    """Enable EPLB with redundant experts for better load balancing.
+    When enabled, each EP rank holds additional redundant expert replicas
+    that can be used to balance the load across experts."""
+
+    moe_num_redundant_experts_per_rank: int = 0
+    """Number of redundant expert replicas each EP rank holds.
+    Must be > 0 when moe_enable_ultraep is True."""
+
+    ##################
     # Context Parallel
     ##################
     cp_comm_type: Optional[Union[str, List[str]]] = None
@@ -1048,6 +1060,27 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"moe_shared_expert_overlap only works with alltoall token dispatcher."
                 )
+
+        # EPLB validation
+        if self.moe_enable_ultraep:
+            if self.moe_num_redundant_experts_per_rank <= 0:
+                raise ValueError(
+                    "moe_num_redundant_experts_per_rank must be > 0 when moe_enable_ultraep is True"
+                )
+            if self.expert_model_parallel_size <= 1:
+                raise ValueError(
+                    "EPLB requires expert_model_parallel_size > 1"
+                )
+            if self.moe_token_dispatcher_type not in ["alltoall", "flex"]:
+                raise ValueError(
+                    f"EPLB only works with alltoall or flex token dispatcher, "
+                    f"but got {self.moe_token_dispatcher_type}"
+                )
+            if self.add_bias_linear:
+                raise ValueError("EPLB does not support add_bias_linear")
+
+            if self.expert_tensor_parallel_size != 1:
+                raise ValueError("EPLB does not support expert tensor parallel (ETP)")
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(

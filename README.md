@@ -1,3 +1,16 @@
+# Megatron-LM with UltraEP Integration
+
+This branch integrates [UltraEP](https://github.com/Dots-Infra/UltraEP) into Megatron-LM (`dev` at [e93814b4](https://github.com/NVIDIA/Megatron-LM/commit/e93814b4c6965c3f8639abdf690416c08937f370)) for online expert load balancing in large-scale MoE training. UltraEP keeps the main balancing controls, and requires minimal (several hundred lines) code changes on Megatron-LM.
+
+For setup instructions, full usage details, and runnable examples, refer to the [UltraEP repository](https://github.com/Dots-Infra/UltraEP). Most performance tuning is controlled by `ULTRA_EP_*` environment variables. Extra arguments on Megatron-LM side are:
+
+```bash
+--moe-enable-ultraep
+--moe-num-redundant-experts-per-rank <N>
+```
+
+## Upstream Megatron-LM README
+
 <div align="center">
 
 Megatron-LM & Megatron Core

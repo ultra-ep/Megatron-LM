@@ -247,6 +247,10 @@ class DistributedDataParallel(_BaseDataParallel):
                 for bucket in bucket_group.buckets:
                     for param in bucket.params_list:
                         self.param_to_bucket_group[param] = bucket_group
+                        # Expose the owning bucket-group on the parameter so that
+                        # non-DDP autograd callbacks (e.g., EPLB finish callback)
+                        # can defer-ready expert params safely.
+                        setattr(param, '_ddp_bucket_group', bucket_group)
 
             return buffers, bucket_groups
 
@@ -440,7 +444,10 @@ class DistributedDataParallel(_BaseDataParallel):
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
-                    self.param_to_bucket_group[param].register_grad_ready(param)
+                    # EPLB master expert params are deferred until EPLB replica
+                    # grad-reduce is finished in _EPLBReplicaGradReduceFinishFunction.
+                    if not getattr(param, 'is_eplb_master', False):
+                        self.param_to_bucket_group[param].register_grad_ready(param)
 
         return hook
 

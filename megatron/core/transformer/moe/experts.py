@@ -17,6 +17,7 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     LocalNonpersistentObject,
     ReplicaId,
+    ShardedObject,
     ShardedStateDict,
     ShardedTensorFactory,
 )
@@ -730,6 +731,36 @@ class GroupedMLP(MegatronModule):
         pass
 
 
+def _parse_te_expert_idx(key: str, module_name: str) -> Optional[int]:
+    """Extract local expert index from a TE GroupedLinear sub_sd key.
+
+    TE's ``_sharded_state_dict_grouped`` produces keys with these patterns
+    (where ``prefix = f"{module_name}."``):
+
+    * ``{module_name}.weight{i}``
+    * ``{module_name}.bias{i}``
+    * ``{module_name}._extra_state``      (expert 0, no numeric suffix)
+    * ``{module_name}._extra_state{i}``   (expert i > 0)
+
+    Returns the integer local expert index, or None if the key doesn't match
+    any expert-indexed pattern.
+    """
+    prefix = f'{module_name}.'
+    if not key.startswith(prefix):
+        return None
+    suffix = key[len(prefix):]
+    for kind in ('weight', 'bias'):
+        if suffix.startswith(kind):
+            idx_str = suffix[len(kind):]
+            if idx_str.isdigit():
+                return int(idx_str)
+    if suffix == '_extra_state':
+        return 0
+    if suffix.startswith('_extra_state') and suffix[len('_extra_state'):].isdigit():
+        return int(suffix[len('_extra_state'):])
+    return None
+
+
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -991,21 +1022,38 @@ class TEGroupedMLP(MegatronModule):
     ) -> ShardedStateDict:
         """
         Maps local expert to global experts.
-        The sharded state dict is interchangable with SequentialMLP's.
+        The sharded state dict is interchangeable with SequentialMLP's.
+
+        When EPLB is enabled (``num_local_master_experts`` attribute is set and
+        smaller than ``num_local_experts``), only master experts are included in
+        the checkpoint.  Replica expert entries are dropped, and the global
+        shape / offset metadata of master expert sharded tensors is corrected to
+        reflect the master-only global expert count.
         """
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
+
+        # EPLB: num_local_master_experts tracks the true (master-only) count.
+        # When EPLB is not active this equals num_local_experts.
+        num_local_master_experts = getattr(self, 'num_local_master_experts', self.num_local_experts)
+        eplb_active = num_local_master_experts < self.num_local_experts
+
         for name, module in self._modules.items():
             sub_sd = sharded_state_dict_default(
                 module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
             )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
-                num_global_experts = self.ep_group.size() * self.num_local_experts
-                local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+                # Use master-only expert count for the GLU sharding when EPLB is active.
+                # This ensures ShardedTensorFactory entries get the correct global offsets.
+                checkpoint_num_experts = (
+                    num_local_master_experts if eplb_active else self.num_local_experts
+                )
+                num_global_experts = self.ep_group.size() * checkpoint_num_experts
+                local_expert_indices_offset = self.ep_group.rank() * checkpoint_num_experts
                 ep_axis = len(sharded_offsets)
-                for i in range(self.num_local_experts):
+                for i in range(checkpoint_num_experts):
                     if singleton_local_shards:
                         new_sharded_offsets = sharded_offsets
                     else:
@@ -1018,6 +1066,15 @@ class TEGroupedMLP(MegatronModule):
                             sub_sd[k] = apply_swiglu_sharded_factory(
                                 sub_sd[k], new_sharded_offsets, singleton_local_shards
                             )
+
+            # EPLB (non-singleton): drop replica entries and fix master metadata.
+            # Singleton mode encodes the expert index in the key name rather than
+            # ShardedTensor offsets, so no metadata patching is needed there.
+            if eplb_active and not singleton_local_shards:
+                sub_sd = self._eplb_filter_and_fix_sharded_state_dict(
+                    sub_sd, name, sharded_offsets, num_local_master_experts
+                )
+
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')
             else:
@@ -1025,6 +1082,91 @@ class TEGroupedMLP(MegatronModule):
                 replace_prefix_for_sharding(sub_sd, f'{name}.', f'{prefix}experts.{name}.')
             sharded_state_dict.update({f"{prefix}{k}": v for k, v in sub_sd.items()})
         return sharded_state_dict
+
+    def _eplb_filter_and_fix_sharded_state_dict(
+        self,
+        sub_sd: dict,
+        module_name: str,
+        sharded_offsets: tuple,
+        num_local_master_experts: int,
+    ) -> dict:
+        """Remove replica expert entries and correct global metadata for masters.
+
+        When EPLB is enabled the TE module creates one sharded tensor per
+        *physical* expert (masters + replicas) with global_shape / global_offset
+        derived from the physical expert count.  This method:
+
+        1. Discards entries whose local expert index >= ``num_local_master_experts``.
+        2. For remaining master entries that are plain ``ShardedTensor`` or
+           ``ShardedObject`` (i.e. not yet processed by the GLU loop), rewrites
+           the EP-axis slot of ``global_shape``, ``global_offset`` and
+           ``axis_fragmentations`` to use the master-only global expert count
+           and the correct master global index.
+        3. ``ShardedTensorFactory`` entries (produced by the GLU loop, which
+           already received the corrected offsets) are kept unchanged.
+
+        Args:
+            sub_sd: sharded state dict from ``sharded_state_dict_default`` for
+                one linear sub-module.
+            module_name: name of that sub-module (e.g. ``"linear_fc1"``).
+            sharded_offsets: outer (PP-level) sharded offsets passed to
+                ``sharded_state_dict``.  The EP axis in the ShardedTensor
+                dimension space sits at index ``len(sharded_offsets)``.
+            num_local_master_experts: number of master experts on this EP rank.
+
+        Returns:
+            Filtered dict containing only master expert entries with corrected
+            global metadata.
+        """
+        from dataclasses import replace as dc_replace
+
+        ep_size = self.ep_group.size()
+        ep_rank = self.ep_group.rank()
+        num_global_master_experts = ep_size * num_local_master_experts
+        ep_axis = len(sharded_offsets)
+
+        filtered = {}
+        for key, value in sub_sd.items():
+            local_expert_idx = _parse_te_expert_idx(key, module_name)
+            if local_expert_idx is None:
+                # Not an expert-indexed key; keep as-is.
+                filtered[key] = value
+                continue
+            if local_expert_idx >= num_local_master_experts:
+                # Replica expert — omit from checkpoint.
+                continue
+
+            correct_global_idx = ep_rank * num_local_master_experts + local_expert_idx
+
+            if isinstance(value, ShardedTensor):
+                gs = list(value.global_shape)
+                go = list(value.global_offset)
+                af = (
+                    list(value.axis_fragmentations)
+                    if value.axis_fragmentations is not None
+                    else None
+                )
+                gs[ep_axis] = num_global_master_experts
+                go[ep_axis] = correct_global_idx
+                if af is not None:
+                    af[ep_axis] = num_global_master_experts
+                value = dc_replace(
+                    value,
+                    global_shape=tuple(gs),
+                    global_offset=tuple(go),
+                    axis_fragmentations=tuple(af) if af is not None else None,
+                )
+            elif isinstance(value, ShardedObject):
+                gs = list(value.global_shape)
+                go = list(value.global_offset)
+                gs[ep_axis] = num_global_master_experts
+                go[ep_axis] = correct_global_idx
+                value = dc_replace(value, global_shape=tuple(gs), global_offset=tuple(go))
+            # ShardedTensorFactory: already carries the corrected offsets set by
+            # the GLU loop — pass through without modification.
+
+            filtered[key] = value
+        return filtered
 
     def backward_dw(self):
         """Performs backward pass for weight gradients in TEGroupedMLP.
